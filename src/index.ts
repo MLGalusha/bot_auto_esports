@@ -38,23 +38,29 @@ import {
   shouldShowImpactSelect,
 } from "./aero-rules.js";
 import { config } from "./config.js";
+import { defaultDevEvidenceUrl, devIncidentCases } from "./dev-cases.js";
 import {
   createIncident,
   formatIncidentId,
   formatStatus,
   getIncident,
-  incidentStatuses,
   listIncidentsForUser,
   updateIncident,
   type Incident,
+  type IncidentDecisionDraft,
+  type IncidentDecisionOutcome,
   type IncidentStatus,
 } from "./incidents.js";
 import {
   buildIncidentEmbed,
+  buildDecisionProposalActions,
   buildLogEmbed,
+  buildParticipantDecisionEmbed,
   buildReviewActions,
+  buildThreadReviewActions,
   buildSubmissionReceiptEmbed,
-  buildUserStatusMessage,
+  formatDecisionDraftForParticipants,
+  formatOtherDrivers,
 } from "./messages.js";
 
 const loggedStatuses = new Set<IncidentStatus>(["no_action", "penalty", "closed"]);
@@ -141,6 +147,11 @@ async function handleCommand(interaction: ChatInputCommandInteraction): Promise<
     await handleStatus(interaction);
     return;
   }
+
+  if (subcommand === "random") {
+    await handleRandomIncident(interaction);
+    return;
+  }
 }
 
 async function handleSubmit(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -196,6 +207,55 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
   });
 }
 
+async function handleRandomIncident(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!interaction.guildId) {
+    await interaction.reply({ content: "Random test incidents can only be created inside a server.", ephemeral: true });
+    return;
+  }
+
+  if (!canModerate(interaction.member, interaction.memberPermissions)) {
+    await interaction.reply({ content: "Only admins can create random test incidents.", ephemeral: true });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  await assertReviewChannelReady();
+
+  const devCase = devIncidentCases[Math.floor(Math.random() * devIncidentCases.length)];
+  const incident = await createIncident({
+    guildId: interaction.guildId,
+    submitterUserId: interaction.user.id,
+    reporterGamertag: devCase.reporterGamertag,
+    category: devCase.category,
+    racePhase: devCase.racePhase,
+    impact: devCase.impact,
+    evidenceReadiness: devCase.evidenceReadiness,
+    involvedUserIds: parseDiscordUserIds(devCase.involvedDriversText),
+    involvedDriversText: devCase.involvedDriversText,
+    event: devCase.event,
+    lapOrTime: devCase.lapOrTime,
+    description: `[TEST CASE: ${devCase.name}]\n${devCase.description}`,
+    evidenceUrl: devCase.evidenceUrl ?? defaultDevEvidenceUrl,
+  });
+
+  const reviewTarget = await postReviewMessage(incident);
+  const updated = await updateIncident(incident.id, (current) => ({
+    ...current,
+    reviewChannelId: reviewTarget.message.channelId,
+    reviewMessageId: reviewTarget.message.id,
+    reviewThreadId: reviewTarget.threadId,
+    reviewThreadMessageId: reviewTarget.threadMessageId,
+  }));
+
+  await interaction.editReply(
+    `Created random test incident ${formatIncidentId(incident.id)} using \`${devCase.name}\` in <#${reviewTarget.message.channelId}>.`,
+  );
+
+  if (updated) {
+    await refreshReviewMessage(updated);
+  }
+}
+
 function buildIncidentListEmbed(incidents: Incident[]): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("Your Incidents")
@@ -237,6 +297,11 @@ function buildIncidentListComponents(
 }
 
 function buildStatusEmbed(incident: Incident): EmbedBuilder {
+  if (incident.finalDecision) {
+    return buildParticipantDecisionEmbed(incident)
+      .setDescription("Official decision published by the admin team.");
+  }
+
   const embed = new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)}`)
     .setColor(0x2563eb)
@@ -249,7 +314,7 @@ function buildStatusEmbed(incident: Incident): EmbedBuilder {
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
       { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
-      { name: "Other Drivers", value: incident.involvedDriversText, inline: false },
+      { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
       { name: "Summary", value: incident.description, inline: false },
     )
     .setTimestamp(new Date());
@@ -367,20 +432,61 @@ async function postReviewMessage(incident: Incident) {
     autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
     reason: `Incident review thread for ${formatIncidentId(incident.id)}`,
   });
+  const threadControls = await thread.send({
+    content: buildReviewThreadControlContent(incident),
+    components: buildThreadReviewActions(incident),
+  });
 
-  return { message, threadId: thread.id };
+  return { message, threadId: thread.id, threadMessageId: threadControls.id };
 }
 
 function buildReviewMessageContent(incident: Incident): string {
   const lines = [
-    `${config.stewardRoleId ? `<@&${config.stewardRoleId}> ` : ""}**New Incident Submitted:** ${formatIncidentId(incident.id)}`,
-    `Open the thread on this card to discuss. Use the card buttons for review decisions.`,
+    `**New Incident Submitted:** ${formatIncidentId(incident.id)}`,
+    `Open the thread on this card to discuss and publish a decision when ready.`,
   ];
 
   return lines.filter(Boolean).join("\n");
 }
 
+function buildReviewThreadControlContent(incident: Incident): string {
+  const lines = [
+    `**Admin Decision:** ${formatIncidentId(incident.id)} | ${formatStatus(incident.status)}`,
+    `Evidence: ${incident.evidenceUrl ?? "No video link submitted."}`,
+  ];
+
+  if (incident.decisionDraft) {
+    lines.push("A proposed decision is posted below. Edit it or publish it when admins agree.");
+  } else if (incident.status === "need_more_info") {
+    lines.push("More info has been requested. Discuss any follow-up here, then use Make Decision when ready.");
+  } else if (incident.finalDecision) {
+    lines.push("This incident has an official published decision.");
+  } else {
+    lines.push("Discuss in this thread. Use the button when admins are ready to write the official driver-facing decision.");
+  }
+
+  return truncateText(lines.join("\n"), 1900);
+}
+
 async function handleStringSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  if (interaction.customId.startsWith("decision-outcome:")) {
+    const [, id] = interaction.customId.split(":");
+    const outcome = interaction.values[0];
+
+    if (!canModerate(interaction.member, interaction.memberPermissions)) {
+      await interaction.reply({ content: "Only admins can make incident decisions.", ephemeral: true });
+      return;
+    }
+
+    if (!isDecisionOutcome(outcome)) {
+      await interaction.reply({ content: "Select a valid decision outcome.", ephemeral: true });
+      return;
+    }
+
+    await interaction.showModal(buildDecisionDraftModal(id, outcome));
+    return;
+  }
+
   if (interaction.customId === "status:select") {
     const incident = await getIncident(interaction.values[0]);
     if (!incident) {
@@ -594,73 +700,160 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
-  const [scope, status, id] = interaction.customId.split(":");
-  if (scope !== "incident" || !isIncidentStatus(status) || !id) {
+  const [scope, action, id] = interaction.customId.split(":");
+  if (!scope || !action || !id) {
     return;
   }
 
-  if (!canModerate(interaction.member, interaction.memberPermissions)) {
+  if (scope.startsWith("incident") && !canModerate(interaction.member, interaction.memberPermissions)) {
     await interaction.reply({ content: "Only admins can update incidents.", ephemeral: true });
     return;
   }
 
-  if (status === "under_review" || status === "closed") {
-    await updateStatus(interaction, id, status);
+  if (scope === "incident-draft" && isDecisionOutcome(action)) {
+    await interaction.showModal(buildDecisionDraftModal(id, action));
     return;
   }
 
-  const modal = new ModalBuilder()
-    .setCustomId(`incident-modal:${status}:${id}`)
-    .setTitle(`${adminActionTitle(status)} ${formatIncidentId(id)}`);
+  if (
+    scope === "incident-admin" ||
+    scope === "incident-vote" ||
+    (scope === "incident-finalize" && action === "preview")
+  ) {
+    const incident = await getIncident(id);
+    if (incident) {
+      await refreshReviewThreadControlMessage(incident);
+    }
+    await interaction.reply({ content: "This incident now uses the simplified Make Decision flow in the thread.", ephemeral: true });
+    return;
+  }
 
-  const note = new TextInputBuilder()
-    .setCustomId("note")
-    .setLabel(adminActionNoteLabel(status))
-    .setPlaceholder(adminActionNotePlaceholder(status))
-    .setStyle(TextInputStyle.Paragraph)
-    .setMaxLength(1000)
-    .setRequired(true);
+  if (scope === "incident-decision" && action === "start") {
+    await showDecisionOutcomePicker(interaction, id);
+    return;
+  }
 
-  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(note));
-  await interaction.showModal(modal);
+  if (scope === "incident-finalize" && action === "confirm") {
+    await finalizeIncident(interaction, id);
+    return;
+  }
 }
 
-function adminActionTitle(status: IncidentStatus): string {
-  switch (status) {
+async function showDecisionOutcomePicker(interaction: ButtonInteraction, id: string): Promise<void> {
+  const incident = await getIncident(id);
+  if (!incident) {
+    await interaction.reply({ content: `I could not find incident ${id}.`, ephemeral: true });
+    return;
+  }
+
+  if (isFinalIncidentStatus(incident.status)) {
+    await interaction.reply({ content: "This incident already has a published final decision.", ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({
+    content: `Choose the official outcome for incident ${formatIncidentId(incident.id)}.`,
+    ephemeral: true,
+    components: [
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`decision-outcome:${incident.id}`)
+          .setPlaceholder("Decision outcome")
+          .addOptions(
+            new StringSelectMenuOptionBuilder()
+              .setLabel("Need More Info")
+              .setDescription("Ask drivers for more evidence or clarification.")
+              .setValue("need_more_info"),
+            new StringSelectMenuOptionBuilder()
+              .setLabel("No Action")
+              .setDescription("Publish a no-action ruling.")
+              .setValue("no_action"),
+            new StringSelectMenuOptionBuilder()
+              .setLabel("Penalty")
+              .setDescription("Publish a penalty ruling.")
+              .setValue("penalty"),
+          ),
+      ),
+    ],
+  });
+}
+
+function buildDecisionDraftModal(id: string, outcome: IncidentDecisionOutcome): ModalBuilder {
+  const modal = new ModalBuilder()
+    .setCustomId(`incident-draft-modal:${outcome}:${id}`)
+    .setTitle(`${decisionDraftTitle(outcome)} ${formatIncidentId(id)}`);
+
+  if (outcome === "penalty") {
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("driver", "Driver receiving penalty", "Example: DriverBravo / @DriverBravo", TextInputStyle.Short),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("rule", "Rule or standard violated", "Example: Avoidable contact entering Turn 1", TextInputStyle.Short),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("penalty", "Penalty", "Example: 5-second post-race penalty", TextInputStyle.Short),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("summary", "Decision wording for drivers", "Explain what happened and why this penalty applies.", TextInputStyle.Paragraph),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("internal_note", "Internal admin note", "Optional context for admins only.", TextInputStyle.Paragraph, false),
+      ),
+    );
+    return modal;
+  }
+
+  if (outcome === "no_action") {
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("rule", "Finding", "Example: Racing incident / insufficient evidence / no rule breach", TextInputStyle.Short),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("summary", "Decision wording for drivers", "Explain why no action will be taken.", TextInputStyle.Paragraph),
+      ),
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        buildDecisionInput("internal_note", "Internal admin note", "Optional context for admins only.", TextInputStyle.Paragraph, false),
+      ),
+    );
+    return modal;
+  }
+
+  modal.addComponents(
+    new ActionRowBuilder<TextInputBuilder>().addComponents(
+      buildDecisionInput("summary", "What should the driver add?", "Example: Need a longer clip showing corner entry and exit.", TextInputStyle.Paragraph),
+    ),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(
+      buildDecisionInput("internal_note", "Internal admin note", "Optional context for admins only.", TextInputStyle.Paragraph, false),
+    ),
+  );
+  return modal;
+}
+
+function buildDecisionInput(
+  customId: string,
+  label: string,
+  placeholder: string,
+  style: TextInputStyle,
+  required = true,
+): TextInputBuilder {
+  return new TextInputBuilder()
+    .setCustomId(customId)
+    .setLabel(label)
+    .setPlaceholder(placeholder)
+    .setStyle(style)
+    .setMaxLength(style === TextInputStyle.Short ? 120 : 1000)
+    .setRequired(required);
+}
+
+function decisionDraftTitle(outcome: IncidentDecisionOutcome): string {
+  switch (outcome) {
     case "need_more_info":
       return "Request Info";
-    case "no_action":
-      return "No Action";
     case "penalty":
-      return "Penalty";
-    default:
-      return formatStatus(status);
-  }
-}
-
-function adminActionNoteLabel(status: IncidentStatus): string {
-  switch (status) {
-    case "need_more_info":
-      return "What should the driver add?";
+      return "Draft Penalty";
     case "no_action":
-      return "Reason for no action";
-    case "penalty":
-      return "Penalty decision";
-    default:
-      return "Admin note";
-  }
-}
-
-function adminActionNotePlaceholder(status: IncidentStatus): string {
-  switch (status) {
-    case "need_more_info":
-      return "Example: Need a longer clip showing corner entry and exit.";
-    case "no_action":
-      return "Example: Racing incident; no avoidable contact found.";
-    case "penalty":
-      return "Example: 5-second penalty for avoidable contact.";
-    default:
-      return "Add the note users/admins should see.";
+      return "Draft No Action";
   }
 }
 
@@ -690,8 +883,8 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
     return;
   }
 
-  const [scope, status, id] = interaction.customId.split(":");
-  if (scope !== "incident-modal" || !isIncidentStatus(status) || !id) {
+  const [scope, outcome, id] = interaction.customId.split(":");
+  if (scope !== "incident-draft-modal" || !isDecisionOutcome(outcome) || !id) {
     return;
   }
 
@@ -700,8 +893,7 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
     return;
   }
 
-  const note = interaction.fields.getTextInputValue("note");
-  await updateStatus(interaction, id, status, note);
+  await saveDecisionDraft(interaction, id, outcome);
 }
 
 function buildIntakeEmbed(draft: IntakeDraft): EmbedBuilder {
@@ -1041,6 +1233,7 @@ async function submitIncidentDraft(interaction: ButtonInteraction, draft: Requir
     reviewChannelId: reviewTarget.message.channelId,
     reviewMessageId: reviewTarget.message.id,
     reviewThreadId: reviewTarget.threadId,
+    reviewThreadMessageId: reviewTarget.threadMessageId,
   }));
   const incidents = await listIncidentsForUser(interaction.guildId, interaction.user.id);
 
@@ -1097,24 +1290,131 @@ async function handleFollowUpModal(interaction: ModalSubmitInteraction): Promise
   });
 }
 
-async function updateStatus(
-  interaction: ButtonInteraction | ModalSubmitInteraction,
+async function saveDecisionDraft(
+  interaction: ModalSubmitInteraction,
   id: string,
-  status: IncidentStatus,
-  note?: string,
+  outcome: IncidentDecisionOutcome,
 ): Promise<void> {
+  const now = new Date().toISOString();
+  const existing = await getIncident(id);
+  if (existing && isFinalIncidentStatus(existing.status)) {
+    await interaction.reply({ content: "Finalized incidents cannot be edited. Reopen support can be added separately.", ephemeral: true });
+    return;
+  }
+
+  const draft: IncidentDecisionDraft = {
+    outcome,
+    createdByUserId: existing?.decisionDraft?.createdByUserId ?? interaction.user.id,
+    updatedByUserId: interaction.user.id,
+    updatedAt: now,
+    driver: getOptionalModalTextValue(interaction, "driver").trim() || undefined,
+    rule: getOptionalModalTextValue(interaction, "rule").trim() || undefined,
+    penalty: getOptionalModalTextValue(interaction, "penalty").trim() || undefined,
+    summary: interaction.fields.getTextInputValue("summary").trim(),
+    internalNote: getOptionalModalTextValue(interaction, "internal_note").trim() || undefined,
+  };
+
   const incident = await updateIncident(id, (current) => ({
     ...current,
-    status,
-    decisionNote: note ?? current.decisionNote,
+    status: current.status === "queued_review" || current.status === "need_more_info" ? "under_review" : current.status,
+    decisionDraft: draft,
+    finalDecision: undefined,
+    decisionNote: undefined,
     history: [
       ...current.history,
       {
         actorUserId: interaction.user.id,
-        action: `set_${status}`,
-        status,
-        note,
-        createdAt: new Date().toISOString(),
+        action: `draft_${outcome}`,
+        status: current.status === "queued_review" || current.status === "need_more_info" ? "under_review" : current.status,
+        note: formatDecisionDraftForParticipants(draft),
+        createdAt: now,
+      },
+    ],
+  }));
+
+  if (!incident) {
+    await interaction.reply({ content: `I could not find incident ${id}.`, ephemeral: true });
+    return;
+  }
+
+  await refreshReviewThreadControlMessage(incident);
+  await upsertDecisionProposalMessage(incident);
+  await interaction.reply({
+    content: `${formatIncidentId(incident.id)} proposed decision posted in the thread.`,
+    ephemeral: true,
+  });
+}
+
+async function upsertDecisionProposalMessage(incident: Incident): Promise<void> {
+  if (!incident.reviewThreadId || !incident.decisionDraft) {
+    return;
+  }
+
+  const thread = await client.channels.fetch(incident.reviewThreadId);
+  if (!thread?.isThread()) {
+    return;
+  }
+
+  const content = [
+    `**Proposed Decision for ${formatIncidentId(incident.id)}**`,
+    `Prepared by <@${incident.decisionDraft.updatedByUserId}>`,
+    "",
+    formatDecisionDraftForParticipants(incident.decisionDraft),
+    "",
+    "Admins can discuss this wording in the thread. Publish only when this is ready to send to drivers.",
+  ].join("\n");
+
+  if (incident.reviewDecisionMessageId) {
+    try {
+      const message = await thread.messages.fetch(incident.reviewDecisionMessageId);
+      await message.edit({
+        content,
+        components: buildDecisionProposalActions(incident),
+      });
+      return;
+    } catch {
+      // If the proposal was deleted, recreate it below.
+    }
+  }
+
+  const message = await thread.send({
+    content,
+    components: buildDecisionProposalActions(incident),
+  });
+
+  await updateIncident(incident.id, (current) => ({
+    ...current,
+    reviewDecisionMessageId: message.id,
+  }));
+}
+
+async function finalizeIncident(interaction: ButtonInteraction, id: string): Promise<void> {
+  const existing = await getIncident(id);
+  if (!existing?.decisionDraft) {
+    await interaction.reply({ content: "Draft a decision before finalizing this incident.", ephemeral: true });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const draft = existing.decisionDraft;
+  const incident = await updateIncident(id, (current) => ({
+    ...current,
+    status: draft.outcome,
+    decisionNote: formatDecisionDraftForParticipants(draft),
+    finalDecision: {
+      ...draft,
+      finalizedByUserId: interaction.user.id,
+      finalizedAt: now,
+    },
+    decisionDraft: undefined,
+    history: [
+      ...current.history,
+      {
+        actorUserId: interaction.user.id,
+        action: `finalize_${draft.outcome}`,
+        status: draft.outcome,
+        note: formatDecisionDraftForParticipants(draft),
+        createdAt: now,
       },
     ],
   }));
@@ -1128,29 +1428,65 @@ async function updateStatus(
   await notifyParticipants(incident);
   await maybePostIncidentLog(incident);
 
-  const content = `${formatIncidentId(incident.id)} updated to ${formatStatus(incident.status)}.`;
-  if (interaction.isButton()) {
-    await interaction.reply({ content, ephemeral: true });
-  } else {
-    await interaction.reply({ content, ephemeral: true });
+  if (interaction.replied || interaction.deferred) {
+    await interaction.followUp({ content: `${formatIncidentId(incident.id)} finalized as ${formatStatus(incident.status)}.`, ephemeral: true });
+    return;
   }
+
+  await interaction.update({
+    content: `${formatIncidentId(incident.id)} finalized as ${formatStatus(incident.status)}.`,
+    embeds: [],
+    components: [],
+  });
 }
 
 async function refreshReviewMessage(incident: Incident): Promise<void> {
-  if (!incident.reviewChannelId || !incident.reviewMessageId) {
+  if (incident.reviewChannelId && incident.reviewMessageId) {
+    const channel = await client.channels.fetch(incident.reviewChannelId);
+    if (channel && channel.type === ChannelType.GuildText) {
+      const message = await (channel as TextChannel).messages.fetch(incident.reviewMessageId);
+      await message.edit({
+        embeds: [buildIncidentEmbed(incident)],
+        components: buildReviewActions(incident),
+      });
+    }
+  }
+
+  await refreshReviewThreadControlMessage(incident);
+}
+
+async function refreshReviewThreadControlMessage(incident: Incident): Promise<void> {
+  if (!incident.reviewThreadId) {
     return;
   }
 
-  const channel = await client.channels.fetch(incident.reviewChannelId);
-  if (!channel || channel.type !== ChannelType.GuildText) {
+  const thread = await client.channels.fetch(incident.reviewThreadId);
+  if (!thread?.isThread()) {
     return;
   }
 
-  const message = await (channel as TextChannel).messages.fetch(incident.reviewMessageId);
-  await message.edit({
-    embeds: [buildIncidentEmbed(incident)],
-    components: buildReviewActions(incident),
+  if (incident.reviewThreadMessageId) {
+    try {
+      const message = await thread.messages.fetch(incident.reviewThreadMessageId);
+      await message.edit({
+        content: buildReviewThreadControlContent(incident),
+        components: buildThreadReviewActions(incident),
+      });
+      return;
+    } catch {
+      // If the control message was deleted, recreate it below.
+    }
+  }
+
+  const message = await thread.send({
+    content: buildReviewThreadControlContent(incident),
+    components: buildThreadReviewActions(incident),
   });
+
+  await updateIncident(incident.id, (current) => ({
+    ...current,
+    reviewThreadMessageId: message.id,
+  }));
 }
 
 async function notifyParticipants(incident: Incident): Promise<void> {
@@ -1159,7 +1495,10 @@ async function notifyParticipants(incident: Incident): Promise<void> {
   await Promise.allSettled(
     userIds.map(async (userId) => {
       const user = await client.users.fetch(userId);
-      await user.send(buildUserStatusMessage(incident));
+      await user.send({
+        content: `A decision has been published for incident ${formatIncidentId(incident.id)}.`,
+        embeds: [buildParticipantDecisionEmbed(incident)],
+      });
     }),
   );
 }
@@ -1386,8 +1725,12 @@ function formatInteractionError(error: unknown): string {
   return "Something went wrong while handling that incident action.";
 }
 
-function isIncidentStatus(value: string | undefined): value is IncidentStatus {
-  return incidentStatuses.includes(value as IncidentStatus);
+function isDecisionOutcome(value: string | undefined): value is IncidentDecisionOutcome {
+  return value === "need_more_info" || value === "no_action" || value === "penalty";
+}
+
+function isFinalIncidentStatus(status: IncidentStatus): boolean {
+  return status === "no_action" || status === "penalty" || status === "closed";
 }
 
 function parseDiscordUserIds(value: string): string[] {
@@ -1416,7 +1759,7 @@ function normalizeDrivers(value: string): string[] {
   return Array.from(
     new Set(
       value
-        .split(/\r?\n/)
+        .split(/[\n,]+/)
         .map((driver) => driver.trim())
         .filter(Boolean),
     ),

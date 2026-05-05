@@ -32,10 +32,34 @@ export type Incident = {
   reviewChannelId?: string;
   reviewMessageId?: string;
   reviewThreadId?: string;
+  reviewThreadMessageId?: string;
+  reviewDecisionMessageId?: string;
+  assignedAdminUserId?: string;
+  decisionDraft?: IncidentDecisionDraft;
+  finalDecision?: IncidentFinalDecision;
   decisionNote?: string;
   createdAt: string;
   updatedAt: string;
   history: IncidentHistoryEvent[];
+};
+
+export type IncidentDecisionOutcome = "need_more_info" | "no_action" | "penalty";
+
+export type IncidentDecisionDraft = {
+  outcome: IncidentDecisionOutcome;
+  createdByUserId: string;
+  updatedByUserId: string;
+  updatedAt: string;
+  driver?: string;
+  rule?: string;
+  penalty?: string;
+  summary: string;
+  internalNote?: string;
+};
+
+export type IncidentFinalDecision = IncidentDecisionDraft & {
+  finalizedByUserId: string;
+  finalizedAt: string;
 };
 
 export type IncidentHistoryEvent = {

@@ -19,5 +19,10 @@ export const commands = [
         .setName("status")
         .setDescription("Open your incident status list."),
     )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("random")
+        .setDescription("Create a random test incident for admin review."),
+    )
     .toJSON(),
 ];

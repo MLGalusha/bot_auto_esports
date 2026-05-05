@@ -6,14 +6,23 @@ import {
   type APIEmbedField,
 } from "discord.js";
 import {
-  getEvidenceReadinessLabel,
   getIncidentCategoryLabel,
   getIncidentImpactLabel,
   getRacePhaseLabel,
 } from "./aero-rules.js";
-import { formatIncidentId, formatStatus, type Incident, type IncidentStatus } from "./incidents.js";
+import {
+  formatIncidentId,
+  formatStatus,
+  type Incident,
+  type IncidentDecisionDraft,
+  type IncidentStatus,
+} from "./incidents.js";
 
 export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
+  if (incident.finalDecision) {
+    return buildFinalReviewEmbed(incident);
+  }
+
   const fields: APIEmbedField[] = [
     { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
     { name: "Reporter", value: `<@${incident.submitterUserId}>`, inline: true },
@@ -23,14 +32,10 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
     { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
     { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Video Status", value: getEvidenceReadinessLabel(incident.evidenceReadiness), inline: true },
     { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
     {
       name: "Other Drivers",
-      value:
-        incident.involvedUserIds.length > 0
-          ? incident.involvedUserIds.map((userId) => `<@${userId}>`).join(", ")
-          : incident.involvedDriversText,
+      value: formatOtherDrivers(incident),
       inline: false,
     },
     { name: "Description", value: incident.description, inline: false },
@@ -41,7 +46,11 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     fields.push({ name: "Follow-Ups", value: followUps, inline: false });
   }
 
-  if (incident.decisionNote) {
+  if (incident.finalDecision) {
+    fields.push({ name: "Final Decision", value: formatDecisionDraft(incident.finalDecision, "admin"), inline: false });
+  }
+
+  if (incident.decisionNote && !incident.finalDecision) {
     fields.push({ name: "Decision Note", value: incident.decisionNote, inline: false });
   }
 
@@ -62,57 +71,177 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)} Review`)
     .setColor(statusColor(incident.status))
-    .setDescription("Review the clip and discussion thread, then choose a decision below.")
+    .setDescription("Discuss in the thread. The card updates when an official decision is published.")
     .addFields(fields)
     .setTimestamp(null);
 }
 
-export function buildReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
-  const decisionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`incident:under_review:${incident.id}`)
-      .setLabel("Reviewing")
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(incident.status === "under_review"),
-    new ButtonBuilder()
-      .setCustomId(`incident:need_more_info:${incident.id}`)
-      .setLabel("Need Info")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(incident.status === "need_more_info"),
-    new ButtonBuilder()
-      .setCustomId(`incident:no_action:${incident.id}`)
-      .setLabel("No Action")
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(incident.status === "no_action"),
-    new ButtonBuilder()
-      .setCustomId(`incident:penalty:${incident.id}`)
-      .setLabel("Penalty")
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled(incident.status === "penalty"),
-    new ButtonBuilder()
-      .setCustomId(`incident:closed:${incident.id}`)
-      .setLabel("Close")
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(incident.status === "closed"),
-  );
+function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
+  const decision = incident.finalDecision;
+  if (!decision) {
+    return buildIncidentEmbed(incident);
+  }
 
-  const evidenceButton = incident.evidenceUrl
-    ? new ButtonBuilder()
-        .setLabel("Open Video")
-        .setStyle(ButtonStyle.Link)
-        .setURL(incident.evidenceUrl)
-    : new ButtonBuilder()
-        .setCustomId(`incident:no_video:${incident.id}`)
-        .setLabel("No Video Link")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true);
-
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [
-    decisionRow,
-    new ActionRowBuilder<ButtonBuilder>().addComponents(evidenceButton),
+  const fields: APIEmbedField[] = [
+    { name: "Outcome", value: formatDecisionOutcome(decision.outcome), inline: true },
+    { name: "Published", value: formatDiscordTimestamp(decision.finalizedAt), inline: true },
+    { name: "Published By", value: `<@${decision.finalizedByUserId}>`, inline: true },
   ];
 
-  return rows;
+  if (decision.driver) {
+    fields.push({ name: "Driver", value: decision.driver, inline: true });
+  }
+  if (decision.penalty) {
+    fields.push({ name: "Penalty", value: decision.penalty, inline: true });
+  }
+  if (decision.rule) {
+    fields.push({ name: "Finding / Rule", value: decision.rule, inline: false });
+  }
+
+  fields.push({ name: "Official Decision", value: decision.summary, inline: false });
+
+  if (decision.internalNote) {
+    fields.push({ name: "Internal Admin Note", value: decision.internalNote, inline: false });
+  }
+
+  fields.push(
+    { name: "Incident Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
+    { name: "Reporter", value: `<@${incident.submitterUserId}>`, inline: true },
+    { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
+    { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
+    { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
+    { name: "Time", value: incident.lapOrTime, inline: true },
+    { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
+    { name: "Original Report", value: incident.description, inline: false },
+  );
+
+  if (incident.evidenceUrl) {
+    fields.push({ name: "Evidence", value: incident.evidenceUrl, inline: false });
+  }
+
+  return new EmbedBuilder()
+    .setTitle(`Incident ${formatIncidentId(incident.id)} Final Decision`)
+    .setColor(statusColor(incident.status))
+    .setDescription("Official ruling has been published to the involved drivers.")
+    .addFields(fields)
+    .setTimestamp(new Date(decision.finalizedAt));
+}
+
+export function buildReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
+  return [];
+}
+
+export function buildThreadReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
+  const decisionButton = new ButtonBuilder()
+    .setCustomId(`incident-decision:start:${incident.id}`)
+    .setLabel(incident.decisionDraft ? "Edit Decision" : "Make Decision")
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(isFinalStatus(incident.status));
+
+  const buttons = [decisionButton];
+  if (incident.evidenceUrl) {
+    buttons.push(new ButtonBuilder().setLabel("Open Video").setStyle(ButtonStyle.Link).setURL(incident.evidenceUrl));
+  }
+
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)];
+}
+
+export function buildDecisionProposalActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`incident-finalize:confirm:${incident.id}`)
+        .setLabel("Publish Decision")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(!incident.decisionDraft || isFinalStatus(incident.status)),
+      new ButtonBuilder()
+        .setCustomId(`incident-decision:start:${incident.id}`)
+        .setLabel("Edit")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(isFinalStatus(incident.status)),
+    ),
+  ];
+}
+
+export function formatDecisionDraft(draft: IncidentDecisionDraft, audience: "admin" | "driver" = "driver"): string {
+  const lines = [`Outcome: **${formatDecisionOutcome(draft.outcome)}**`];
+
+  if (draft.driver) {
+    lines.push(`Driver: ${draft.driver}`);
+  }
+  if (draft.rule) {
+    lines.push(`Rule: ${draft.rule}`);
+  }
+  if (draft.penalty) {
+    lines.push(`Penalty: ${draft.penalty}`);
+  }
+
+  lines.push(`Summary: ${draft.summary}`);
+
+  if (audience === "admin" && draft.internalNote) {
+    lines.push(`Internal: ${draft.internalNote}`);
+  }
+
+  return truncateText(lines.join("\n"), audience === "admin" ? 1000 : 1600);
+}
+
+export function formatDecisionDraftForParticipants(draft: IncidentDecisionDraft): string {
+  return formatDecisionDraft(draft, "driver");
+}
+
+export function buildParticipantDecisionEmbed(incident: Incident): EmbedBuilder {
+  const decision = incident.finalDecision;
+  const embed = new EmbedBuilder()
+    .setTitle(`Incident ${formatIncidentId(incident.id)} Decision`)
+    .setColor(statusColor(incident.status))
+    .setTimestamp(decision ? new Date(decision.finalizedAt) : new Date())
+    .addFields(
+      { name: "Outcome", value: decision ? formatDecisionOutcome(decision.outcome) : formatStatus(incident.status), inline: true },
+      { name: "Incident Time", value: incident.lapOrTime, inline: true },
+      { name: "Rule Area", value: getIncidentCategoryLabel(incident.category), inline: true },
+    );
+
+  if (decision) {
+    if (decision.driver) {
+      embed.addFields({ name: "Driver", value: decision.driver, inline: true });
+    }
+    if (decision.penalty) {
+      embed.addFields({ name: "Penalty", value: decision.penalty, inline: true });
+    }
+    if (decision.rule) {
+      embed.addFields({ name: "Finding / Rule", value: decision.rule, inline: false });
+    }
+
+    embed.addFields({ name: "Decision", value: decision.summary, inline: false });
+  } else if (incident.decisionNote) {
+    embed.addFields({ name: "Decision", value: incident.decisionNote, inline: false });
+  }
+
+  embed.addFields(
+    { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
+    { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
+  );
+
+  if (incident.evidenceUrl) {
+    embed.addFields({ name: "Evidence", value: incident.evidenceUrl, inline: false });
+  }
+
+  return embed;
+}
+
+function formatDecisionOutcome(outcome: IncidentDecisionDraft["outcome"]): string {
+  switch (outcome) {
+    case "need_more_info":
+      return "Need More Info";
+    case "no_action":
+      return "No Action";
+    case "penalty":
+      return "Penalty";
+  }
+}
+
+function isFinalStatus(status: IncidentStatus): boolean {
+  return status === "no_action" || status === "penalty" || status === "closed";
 }
 
 function truncateText(value: string, maxLength: number): string {
@@ -147,24 +276,10 @@ export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
       { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
-      { name: "Other Drivers", value: incident.involvedDriversText, inline: false },
+      { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
       { name: "Summary", value: incident.description, inline: false },
     )
     .setTimestamp(new Date());
-}
-
-export function buildUserStatusMessage(incident: Incident): string {
-  const base = [
-    `Incident ${formatIncidentId(incident.id)} is now **${formatStatus(incident.status)}**.`,
-    `Your Gamertag: ${incident.reporterGamertag ?? "Not provided"}`,
-    `Time: ${incident.lapOrTime}`,
-  ];
-
-  if (incident.decisionNote) {
-    base.push(`Note: ${incident.decisionNote}`);
-  }
-
-  return base.join("\n");
 }
 
 export function buildLogEmbed(incident: Incident): EmbedBuilder {
@@ -184,6 +299,19 @@ export function buildLogEmbed(incident: Incident): EmbedBuilder {
       value: history || "No timeline entries recorded.",
       inline: false,
     });
+}
+
+export function formatOtherDrivers(incident: Incident): string {
+  if (incident.involvedUserIds.length > 0) {
+    return incident.involvedUserIds.map((userId) => `<@${userId}>`).join("\n");
+  }
+
+  const drivers = incident.involvedDriversText
+    .split(/[\n,]+/)
+    .map((driver) => driver.trim())
+    .filter(Boolean);
+
+  return drivers.length > 0 ? drivers.join("\n") : "Not provided";
 }
 
 function statusColor(status: IncidentStatus): number {

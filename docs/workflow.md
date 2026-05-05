@@ -22,19 +22,13 @@ No public incident or penalty log is part of the MVP.
 
 ## Admin Flow
 
-1. Bot posts one review card in `#incident-review` with the incident details, video link, and decision buttons.
-2. Bot creates a thread on that card for private admin discussion.
-3. Admins discuss in the thread.
-4. Admins use review-card buttons to update status:
-
-- `Under Review`
-- `Need Info`
-- `No Action`
-- `Penalty`
-- `Close`
-
-5. For `Need Info`, `No Action`, and `Penalty`, the bot opens a modal so admins can record the note or decision.
-6. Final statuses are optionally posted to the private `#incident-log`.
+1. Bot posts one review card in `#incident-review` with the incident details and video link.
+2. Bot creates a thread on that card for private admin discussion and seeds it with a compact decision control message.
+3. Admins discuss freely in the thread.
+4. When admins are ready, they use the thread `Make Decision` button.
+5. Bot asks for the outcome, then opens a structured modal for the driver-facing decision wording.
+6. Bot posts the proposed decision in the thread with `Publish Decision` and `Edit` buttons.
+7. `Publish Decision` updates the incident, DMs participants, updates the review card, and optionally posts to the private `#incident-log`.
 
 ## Notification Policy
 

@@ -5,8 +5,8 @@ Discord bot for submitting racing incidents, routing them to a private admin rev
 Each submitted incident creates:
 
 - A private review card in the configured admin channel with the incident details, evidence link, and admin actions.
-- A discussion thread attached to that review card.
-- Buttons for admin status updates and decisions.
+- A discussion thread attached to that review card with a compact decision control message.
+- A thread decision flow for publishing official driver-facing outcomes.
 - Optional private log entries when final statuses are reached.
 
 ## Local Setup
@@ -101,21 +101,28 @@ npm run dev
 /incident submit
 /incident status
 /incident setup-check
+/incident random
 ```
 
-Admin actions are handled with buttons on the private review message.
+Admin decisions are handled from the private review thread.
 
 ## First Test Flow
 
 1. Run `npm run register:commands`.
 2. Run `npm run dev`.
-3. In the test server, submit an incident:
+3. In the test server, submit an incident manually:
 
 ```text
 /incident submit
 ```
 
-4. Complete the private intake board:
+Or create a random admin test incident:
+
+```text
+/incident random
+```
+
+4. For manual submissions, complete the private intake board:
    - Rule area
    - Race phase
    - Impact / severity
@@ -123,7 +130,7 @@ Admin actions are handled with buttons on the private review message.
 5. Fill out your gamertag, video link, incident time, and description from the intake buttons. Add other involved drivers/gamertags if known.
 7. Confirm the bot posts a review message in the private review channel.
 8. Confirm the bot creates a thread for that incident.
-9. Use the admin buttons to move it to `Under Review`, `Need Info`, `No Action`, `Penalty`, or `Closed`.
+9. Discuss in the incident thread, then use `Make Decision` to propose and publish `Need Info`, `No Action`, or `Penalty`.
 10. Use `/incident status` to reopen the newest incident card. Use the `Incident List` dropdown to switch incidents, or the follow-up button to add info after `Need Info`.
 
 If submission fails with a review channel permission message, run:
