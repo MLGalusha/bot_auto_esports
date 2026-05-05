@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export const incidentStatuses = [
@@ -17,7 +17,7 @@ export type Incident = {
   id: string;
   guildId: string;
   submitterUserId: string;
-  reporterGamertag?: string;
+  reporterGamertag?: string | undefined;
   category: string;
   racePhase: string;
   impact: string;
@@ -27,17 +27,17 @@ export type Incident = {
   event: string;
   lapOrTime: string;
   description: string;
-  evidenceUrl?: string;
+  evidenceUrl?: string | undefined;
   status: IncidentStatus;
-  reviewChannelId?: string;
-  reviewMessageId?: string;
-  reviewThreadId?: string;
-  reviewThreadMessageId?: string;
-  reviewDecisionMessageId?: string;
-  assignedAdminUserId?: string;
-  decisionDraft?: IncidentDecisionDraft;
-  finalDecision?: IncidentFinalDecision;
-  decisionNote?: string;
+  reviewChannelId?: string | undefined;
+  reviewMessageId?: string | undefined;
+  reviewThreadId?: string | undefined;
+  reviewThreadMessageId?: string | undefined;
+  reviewDecisionMessageId?: string | undefined;
+  assignedAdminUserId?: string | undefined;
+  decisionDraft?: IncidentDecisionDraft | undefined;
+  finalDecision?: IncidentFinalDecision | undefined;
+  decisionNote?: string | undefined;
   createdAt: string;
   updatedAt: string;
   history: IncidentHistoryEvent[];
@@ -50,11 +50,11 @@ export type IncidentDecisionDraft = {
   createdByUserId: string;
   updatedByUserId: string;
   updatedAt: string;
-  driver?: string;
-  rule?: string;
-  penalty?: string;
+  driver?: string | undefined;
+  rule?: string | undefined;
+  penalty?: string | undefined;
   summary: string;
-  internalNote?: string;
+  internalNote?: string | undefined;
 };
 
 export type IncidentFinalDecision = IncidentDecisionDraft & {
@@ -66,7 +66,7 @@ export type IncidentHistoryEvent = {
   actorUserId: string;
   action: string;
   status: IncidentStatus;
-  note?: string;
+  note?: string | undefined;
   createdAt: string;
 };
 
@@ -76,6 +76,7 @@ type IncidentStoreData = {
 };
 
 const storePath = "data/incidents.json";
+let storeQueue = Promise.resolve();
 
 async function readStore(): Promise<IncidentStoreData> {
   try {
@@ -91,7 +92,18 @@ async function readStore(): Promise<IncidentStoreData> {
 
 async function writeStore(data: IncidentStoreData): Promise<void> {
   await mkdir(dirname(storePath), { recursive: true });
-  await writeFile(storePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  const tempPath = `${storePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  await rename(tempPath, storePath);
+}
+
+async function withStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+  const run = storeQueue.then(operation, operation);
+  storeQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
 }
 
 export async function createIncident(input: {
@@ -107,61 +119,70 @@ export async function createIncident(input: {
   event: string;
   lapOrTime: string;
   description: string;
-  evidenceUrl?: string;
+  evidenceUrl?: string | undefined;
 }): Promise<Incident> {
-  const store = await readStore();
-  const now = new Date().toISOString();
-  const id = `INC-${String(store.nextNumber).padStart(4, "0")}`;
-  const incident: Incident = {
-    id,
-    guildId: input.guildId,
-    submitterUserId: input.submitterUserId,
-    reporterGamertag: input.reporterGamertag,
-    category: input.category,
-    racePhase: input.racePhase,
-    impact: input.impact,
-    evidenceReadiness: input.evidenceReadiness,
-    involvedUserIds: Array.from(new Set(input.involvedUserIds)),
-    involvedDriversText: input.involvedDriversText,
-    event: input.event,
-    lapOrTime: input.lapOrTime,
-    description: input.description,
-    evidenceUrl: input.evidenceUrl,
-    status: "queued_review",
-    createdAt: now,
-    updatedAt: now,
-    history: [
-      {
-        actorUserId: input.submitterUserId,
-        action: "submitted",
-        status: "queued_review",
-        createdAt: now,
-      },
-    ],
-  };
+  return withStoreLock(async () => {
+    const store = await readStore();
+    const now = new Date().toISOString();
+    const id = `INC-${String(store.nextNumber).padStart(4, "0")}`;
+    const incident: Incident = {
+      id,
+      guildId: input.guildId,
+      submitterUserId: input.submitterUserId,
+      reporterGamertag: input.reporterGamertag,
+      category: input.category,
+      racePhase: input.racePhase,
+      impact: input.impact,
+      evidenceReadiness: input.evidenceReadiness,
+      involvedUserIds: Array.from(new Set(input.involvedUserIds)),
+      involvedDriversText: input.involvedDriversText,
+      event: input.event,
+      lapOrTime: input.lapOrTime,
+      description: input.description,
+      evidenceUrl: input.evidenceUrl,
+      status: "queued_review",
+      createdAt: now,
+      updatedAt: now,
+      history: [
+        {
+          actorUserId: input.submitterUserId,
+          action: "submitted",
+          status: "queued_review",
+          createdAt: now,
+        },
+      ],
+    };
 
-  store.nextNumber += 1;
-  store.incidents.push(incident);
-  await writeStore(store);
-  return incident;
+    store.nextNumber += 1;
+    store.incidents.push(incident);
+    await writeStore(store);
+    return incident;
+  });
 }
 
 export async function updateIncident(
   id: string,
   mutate: (incident: Incident) => Incident,
 ): Promise<Incident | undefined> {
-  id = normalizeIncidentId(id);
-  const store = await readStore();
-  const index = store.incidents.findIndex((incident) => incident.id === id);
-  if (index === -1) {
-    return undefined;
-  }
+  return withStoreLock(async () => {
+    id = normalizeIncidentId(id);
+    const store = await readStore();
+    const index = store.incidents.findIndex((incident) => incident.id === id);
+    if (index === -1) {
+      return undefined;
+    }
 
-  const updated = mutate({ ...store.incidents[index] });
-  updated.updatedAt = new Date().toISOString();
-  store.incidents[index] = updated;
-  await writeStore(store);
-  return updated;
+    const existing = store.incidents[index];
+    if (!existing) {
+      return undefined;
+    }
+
+    const updated = mutate({ ...existing });
+    updated.updatedAt = new Date().toISOString();
+    store.incidents[index] = updated;
+    await writeStore(store);
+    return updated;
+  });
 }
 
 export async function getIncident(id: string): Promise<Incident | undefined> {

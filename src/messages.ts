@@ -18,6 +18,9 @@ import {
   type IncidentStatus,
 } from "./incidents.js";
 
+const embedFieldValueMaxLength = 1024;
+const embedDescriptionMaxLength = 4096;
+
 export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   if (incident.finalDecision) {
     return buildFinalReviewEmbed(incident);
@@ -32,13 +35,13 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
     { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
     { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
+    { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
     {
       name: "Other Drivers",
-      value: formatOtherDrivers(incident),
+      value: truncateEmbedFieldValue(formatOtherDrivers(incident)),
       inline: false,
     },
-    { name: "Description", value: incident.description, inline: false },
+    { name: "Description", value: truncateEmbedFieldValue(incident.description), inline: false },
   ];
 
   const followUps = formatFollowUps(incident, 5);
@@ -51,7 +54,7 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   }
 
   if (incident.decisionNote && !incident.finalDecision) {
-    fields.push({ name: "Decision Note", value: incident.decisionNote, inline: false });
+    fields.push({ name: "Decision Note", value: truncateEmbedFieldValue(incident.decisionNote), inline: false });
   }
 
   const recentTimeline = incident.history
@@ -65,7 +68,7 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     .join("\n");
 
   if (recentTimeline) {
-    fields.push({ name: "Admin Activity", value: recentTimeline, inline: false });
+    fields.push({ name: "Admin Activity", value: truncateEmbedFieldValue(recentTimeline), inline: false });
   }
 
   return new EmbedBuilder()
@@ -98,10 +101,10 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
     fields.push({ name: "Finding / Rule", value: decision.rule, inline: false });
   }
 
-  fields.push({ name: "Official Decision", value: decision.summary, inline: false });
+  fields.push({ name: "Official Decision", value: truncateEmbedFieldValue(decision.summary), inline: false });
 
   if (decision.internalNote) {
-    fields.push({ name: "Internal Admin Note", value: decision.internalNote, inline: false });
+    fields.push({ name: "Internal Admin Note", value: truncateEmbedFieldValue(decision.internalNote), inline: false });
   }
 
   fields.push(
@@ -111,12 +114,12 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
     { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
     { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
     { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
-    { name: "Original Report", value: incident.description, inline: false },
+    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
+    { name: "Original Report", value: truncateEmbedFieldValue(incident.description), inline: false },
   );
 
   if (incident.evidenceUrl) {
-    fields.push({ name: "Evidence", value: incident.evidenceUrl, inline: false });
+    fields.push({ name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl), inline: false });
   }
 
   return new EmbedBuilder()
@@ -125,10 +128,6 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
     .setDescription("Official ruling has been published to the involved drivers.")
     .addFields(fields)
     .setTimestamp(new Date(decision.finalizedAt));
-}
-
-export function buildReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
-  return [];
 }
 
 export function buildThreadReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
@@ -212,18 +211,18 @@ export function buildParticipantDecisionEmbed(incident: Incident): EmbedBuilder 
       embed.addFields({ name: "Finding / Rule", value: decision.rule, inline: false });
     }
 
-    embed.addFields({ name: "Decision", value: decision.summary, inline: false });
+    embed.addFields({ name: "Decision", value: truncateEmbedFieldValue(decision.summary), inline: false });
   } else if (incident.decisionNote) {
-    embed.addFields({ name: "Decision", value: incident.decisionNote, inline: false });
+    embed.addFields({ name: "Decision", value: truncateEmbedFieldValue(incident.decisionNote), inline: false });
   }
 
   embed.addFields(
     { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
-    { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
+    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
   );
 
   if (incident.evidenceUrl) {
-    embed.addFields({ name: "Evidence", value: incident.evidenceUrl, inline: false });
+    embed.addFields({ name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl), inline: false });
   }
 
   return embed;
@@ -252,6 +251,14 @@ function truncateText(value: string, maxLength: number): string {
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+export function truncateEmbedDescription(value: string): string {
+  return truncateText(value, embedDescriptionMaxLength);
+}
+
+export function truncateEmbedFieldValue(value: string): string {
+  return truncateText(value || "\u200b", embedFieldValueMaxLength);
+}
+
 function formatFollowUps(incident: Incident, limit: number): string {
   const followUps = incident.history
     .filter((event) => event.action === "user_response" && event.note)
@@ -275,9 +282,9 @@ export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
-      { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
-      { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
-      { name: "Summary", value: incident.description, inline: false },
+      { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
+      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
+      { name: "Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
     )
     .setTimestamp(new Date());
 }
@@ -286,7 +293,7 @@ export function buildLogEmbed(incident: Incident): EmbedBuilder {
   const history = incident.history
     .slice(-8)
     .map((event) => {
-      const note = event.note ? ` - ${event.note}` : "";
+      const note = event.note ? ` - ${truncateText(event.note, 240)}` : "";
       return `<@${event.actorUserId}> set **${formatStatus(event.status)}**${note}`;
     })
     .join("\n");
@@ -296,7 +303,7 @@ export function buildLogEmbed(incident: Incident): EmbedBuilder {
     .setDescription(`**${formatStatus(incident.status)}**`)
     .addFields({
       name: "Recent Timeline",
-      value: history || "No timeline entries recorded.",
+      value: truncateEmbedFieldValue(history || "No timeline entries recorded."),
       inline: false,
     });
 }

@@ -14,7 +14,7 @@ No public incident or penalty log is part of the MVP.
 
 1. Driver runs `/incident submit`.
 2. Bot opens a private intake board based on AERO rules.
-3. Driver selects rule area, race phase, impact/severity, and video status.
+3. Driver selects rule area, race phase, and impact/severity.
 4. Driver uses the intake buttons to add their gamertag, video link, incident time, and description. Other involved drivers/gamertags can be added if known.
 6. Bot replies privately with the incident ID, status button, and follow-up button.
 7. Driver can use `/incident status` to reopen their newest private incident card, then use the `Incident List` dropdown on that card to switch incidents.

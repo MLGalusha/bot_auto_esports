@@ -24,9 +24,6 @@ import {
   type TextChannel,
 } from "discord.js";
 import {
-  evidenceReadiness,
-  getEvidenceReadinessLabel,
-  getEvidenceReadinessOptions,
   getDefaultIntakeValues,
   getIncidentCategoryLabel,
   getIncidentImpactLabel,
@@ -34,7 +31,6 @@ import {
   getRacePhaseLabel,
   getRacePhaseOptions,
   incidentCategories,
-  shouldShowEvidenceSelect,
   shouldShowImpactSelect,
 } from "./aero-rules.js";
 import { config } from "./config.js";
@@ -56,11 +52,12 @@ import {
   buildDecisionProposalActions,
   buildLogEmbed,
   buildParticipantDecisionEmbed,
-  buildReviewActions,
   buildThreadReviewActions,
   buildSubmissionReceiptEmbed,
   formatDecisionDraftForParticipants,
   formatOtherDrivers,
+  truncateEmbedDescription,
+  truncateEmbedFieldValue,
 } from "./messages.js";
 
 const loggedStatuses = new Set<IncidentStatus>(["no_action", "penalty", "closed"]);
@@ -69,22 +66,32 @@ type IntakeDraft = {
   id: string;
   guildId: string;
   userId: string;
-  reporterGamertag?: string;
-  category?: string;
-  racePhase?: string;
-  impact?: string;
-  evidenceReadiness?: string;
-  evidenceLink?: string;
-  lapOrTime?: string;
-  description?: string;
+  reporterGamertag?: string | undefined;
+  category?: string | undefined;
+  racePhase?: string | undefined;
+  impact?: string | undefined;
+  evidenceReadiness?: string | undefined;
+  evidenceLink?: string | undefined;
+  lapOrTime?: string | undefined;
+  description?: string | undefined;
   drivers: string[];
   createdAt: number;
+};
+
+type CompleteIntakeDraft = IntakeDraft & {
+  reporterGamertag: string;
+  category: string;
+  racePhase: string;
+  impact: string;
+  evidenceReadiness: string;
+  lapOrTime: string;
+  description: string;
 };
 
 const intakeDrafts = new Map<string, IntakeDraft>();
 
 type ParsedIntakeCustomId = {
-  draftId?: string;
+  draftId?: string | undefined;
   action: string;
 };
 
@@ -200,10 +207,20 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
     return;
   }
 
+  const latestIncident = incidents[0];
+  if (!latestIncident) {
+    await interaction.reply({
+      ephemeral: true,
+      embeds: [buildIncidentListEmbed(incidents)],
+      components: [],
+    });
+    return;
+  }
+
   await interaction.reply({
     ephemeral: true,
-    embeds: [buildStatusEmbed(incidents[0])],
-    components: buildStatusComponents(incidents[0], incidents),
+    embeds: [buildStatusEmbed(latestIncident)],
+    components: buildStatusComponents(latestIncident, incidents),
   });
 }
 
@@ -222,6 +239,10 @@ async function handleRandomIncident(interaction: ChatInputCommandInteraction): P
   await assertReviewChannelReady();
 
   const devCase = devIncidentCases[Math.floor(Math.random() * devIncidentCases.length)];
+  if (!devCase) {
+    throw new Error("No random incident test cases are configured.");
+  }
+
   const incident = await createIncident({
     guildId: interaction.guildId,
     submitterUserId: interaction.user.id,
@@ -313,9 +334,9 @@ function buildStatusEmbed(incident: Incident): EmbedBuilder {
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
-      { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
-      { name: "Other Drivers", value: formatOtherDrivers(incident), inline: false },
-      { name: "Summary", value: incident.description, inline: false },
+      { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
+      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
+      { name: "Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
     )
     .setTimestamp(new Date());
 
@@ -325,7 +346,7 @@ function buildStatusEmbed(incident: Incident): EmbedBuilder {
   }
 
   if (incident.decisionNote) {
-    embed.addFields({ name: "Latest Admin Note", value: incident.decisionNote, inline: false });
+    embed.addFields({ name: "Latest Admin Note", value: truncateEmbedFieldValue(incident.decisionNote), inline: false });
   }
 
   return embed;
@@ -424,7 +445,6 @@ async function postReviewMessage(incident: Incident) {
   const message = await channel.send({
     content: buildReviewMessageContent(incident),
     embeds: [buildIncidentEmbed(incident)],
-    components: buildReviewActions(incident),
   });
 
   const thread = await message.startThread({
@@ -465,7 +485,7 @@ function buildReviewThreadControlContent(incident: Incident): string {
     lines.push("Discuss in this thread. Use the button when admins are ready to write the official driver-facing decision.");
   }
 
-  return truncateText(lines.join("\n"), 1900);
+  return truncateEmbedDescription(lines.join("\n"));
 }
 
 async function handleStringSelect(interaction: StringSelectMenuInteraction): Promise<void> {
@@ -483,12 +503,23 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
       return;
     }
 
+    if (!id) {
+      await interaction.reply({ content: "That decision action is missing an incident ID.", ephemeral: true });
+      return;
+    }
+
     await interaction.showModal(buildDecisionDraftModal(id, outcome));
     return;
   }
 
   if (interaction.customId === "status:select") {
-    const incident = await getIncident(interaction.values[0]);
+    const selectedIncidentId = interaction.values[0];
+    if (!selectedIncidentId) {
+      await interaction.reply({ content: "Select an incident first.", ephemeral: true });
+      return;
+    }
+
+    const incident = await getIncident(selectedIncidentId);
     if (!incident) {
       await interaction.update({
         embeds: [
@@ -545,8 +576,14 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
   }
 
   const field = intakeCustomId.action;
+  const selectedValue = interaction.values[0];
+  if (!selectedValue) {
+    await interaction.reply({ content: "Select an option first.", ephemeral: true });
+    return;
+  }
+
   if (field === "category") {
-    draft.category = interaction.values[0];
+    draft.category = selectedValue;
     const defaults = getDefaultIntakeValues(draft.category);
     draft.impact = defaults.impact;
     draft.evidenceReadiness = defaults.evidenceReadiness ?? draft.evidenceReadiness;
@@ -556,15 +593,10 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
     if (shouldShowImpactSelect(draft.category) && !getIncidentImpactOptions(draft.category).some((option) => option.value === draft.impact)) {
       draft.impact = undefined;
     }
-    if (shouldShowEvidenceSelect(draft.category) && !getEvidenceReadinessOptions(draft.category).some((option) => option.value === draft.evidenceReadiness)) {
-      draft.evidenceReadiness = undefined;
-    }
   } else if (field === "phase") {
-    draft.racePhase = interaction.values[0];
+    draft.racePhase = selectedValue;
   } else if (field === "impact") {
-    draft.impact = interaction.values[0];
-  } else if (field === "evidence") {
-    draft.evidenceReadiness = interaction.values[0];
+    draft.impact = selectedValue;
   }
 
   intakeDrafts.set(getIntakeKey(draft.guildId, interaction.user.id), draft);
@@ -590,15 +622,23 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
-    await interaction.update({
-      embeds: [buildStatusEmbed(incidents[0])],
-      components: buildStatusComponents(incidents[0], incidents),
-    });
+    const latestIncident = incidents[0];
+    if (latestIncident) {
+      await interaction.update({
+        embeds: [buildStatusEmbed(latestIncident)],
+        components: buildStatusComponents(latestIncident, incidents),
+      });
+    }
     return;
   }
 
   if (interaction.customId.startsWith("followup:open:")) {
     const [, , id] = interaction.customId.split(":");
+    if (!id) {
+      await interaction.reply({ content: "That follow-up action is missing an incident ID.", ephemeral: Boolean(interaction.guildId) });
+      return;
+    }
+
     const incident = await getIncident(id);
 
     if (!incident) {
@@ -620,6 +660,11 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
 
   if (interaction.customId.startsWith("status:view:")) {
     const [, , id] = interaction.customId.split(":");
+    if (!id) {
+      await interaction.reply({ content: "That status action is missing an incident ID.", ephemeral: Boolean(interaction.guildId) });
+      return;
+    }
+
     const incident = await getIncident(id);
 
     if (!incident) {
@@ -679,7 +724,7 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
-    if (["details", "drivers", "set_video", "set_location", "set_summary"].includes(intakeCustomId.action)) {
+    if (intakeCustomId.action === "details") {
       await interaction.showModal(buildIntakeDetailsModal(draft));
       return;
     }
@@ -858,23 +903,8 @@ function decisionDraftTitle(outcome: IncidentDecisionOutcome): string {
 }
 
 async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
-  if (interaction.customId === "incident-submit") {
-    await interaction.reply({ content: "This form is no longer active. Use `/incident submit` to open the intake card.", ephemeral: true });
-    return;
-  }
-
-  if (
-    interaction.customId === "intake-details" ||
-    interaction.customId.startsWith("intake-details:") ||
-    interaction.customId === "intake-drivers" ||
-    interaction.customId.startsWith("intake-drivers:")
-  ) {
+  if (interaction.customId.startsWith("intake-details:")) {
     await handleIntakeDetailsModal(interaction);
-    return;
-  }
-
-  if (interaction.customId.startsWith("intake-set:")) {
-    await handleLegacyIntakeTextModal(interaction);
     return;
   }
 
@@ -915,10 +945,10 @@ function buildIntakeEmbed(draft: IntakeDraft): EmbedBuilder {
       { name: "Impact", value: getIncidentImpactLabel(draft.impact), inline: true },
       { name: "Report Details", value: "\u200b", inline: false },
       { name: "Your Gamertag", value: draft.reporterGamertag ?? "Not added", inline: true },
-      { name: "Video Link", value: formatDraftVideoLinkStatus(draft), inline: true },
+      { name: "Video Link", value: truncateEmbedFieldValue(formatDraftVideoLinkStatus(draft)), inline: true },
       { name: "Time", value: draft.lapOrTime ?? "Not added", inline: true },
-      { name: "Other Drivers", value: formatDraftDrivers(draft), inline: false },
-      { name: "Summary", value: draft.description ?? "Not added", inline: false },
+      { name: "Other Drivers", value: truncateEmbedFieldValue(formatDraftDrivers(draft)), inline: false },
+      { name: "Summary", value: truncateEmbedFieldValue(draft.description ?? "Not added"), inline: false },
     );
 }
 
@@ -931,12 +961,6 @@ function buildIntakeComponents(draft: IntakeDraft): ActionRowBuilder<StringSelec
   if (shouldShowImpactSelect(draft.category)) {
     rows.push(
       buildSelectRow(buildIntakeCustomId(draft, "impact"), "Impact / severity", getIncidentImpactOptions(draft.category), draft.impact, !draft.category),
-    );
-  }
-
-  if (shouldShowEvidenceSelect(draft.category)) {
-    rows.push(
-      buildSelectRow(buildIntakeCustomId(draft, "evidence"), "Video status", getEvidenceReadinessOptions(draft.category), draft.evidenceReadiness, !draft.category),
     );
   }
 
@@ -1043,7 +1067,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
     .setLabel("What happened?")
     .setPlaceholder("Short summary for admins")
     .setStyle(TextInputStyle.Paragraph)
-    .setMaxLength(1800)
+    .setMaxLength(1000)
     .setRequired(true);
 
   if (draft.description) {
@@ -1102,37 +1126,6 @@ function getOptionalModalTextValue(interaction: ModalSubmitInteraction, customId
   } catch {
     return "";
   }
-}
-
-async function handleLegacyIntakeTextModal(interaction: ModalSubmitInteraction): Promise<void> {
-  if (!interaction.guildId) {
-    await interaction.reply({ content: "Incident details can only be edited inside a server.", ephemeral: true });
-    return;
-  }
-
-  const { draftId, field } = parseIntakeTextModalCustomId(interaction.customId);
-  const draft = getIntakeDraft(interaction.guildId, interaction.user.id);
-  if (!draft) {
-    await updateInactiveIntakeModalSource(interaction, "Incident Intake Expired", "Run `/incident submit` again to start a new report.");
-    return;
-  }
-
-  if (draftId && draftId !== draft.id) {
-    await updateInactiveIntakeModalSource(interaction, "Incident Intake Replaced", "Use the newest intake card or run `/incident submit` again.");
-    return;
-  }
-
-  const value = interaction.fields.getTextInputValue("value").trim();
-  if (field === "video") {
-    draft.evidenceLink = value || undefined;
-  } else if (field === "location") {
-    draft.lapOrTime = value || undefined;
-  } else if (field === "summary") {
-    draft.description = value || undefined;
-  }
-
-  intakeDrafts.set(getIntakeKey(draft.guildId, interaction.user.id), draft);
-  await updateIntakeModalSource(interaction, draft);
 }
 
 async function updateIntakeModalSource(interaction: ModalSubmitInteraction, draft: IntakeDraft): Promise<void> {
@@ -1198,7 +1191,7 @@ function buildFollowUpModal(incident: Incident): ModalBuilder {
   return modal;
 }
 
-async function submitIncidentDraft(interaction: ButtonInteraction, draft: Required<IntakeDraft>): Promise<void> {
+async function submitIncidentDraft(interaction: ButtonInteraction, draft: CompleteIntakeDraft): Promise<void> {
   if (!interaction.guildId) {
     await interaction.reply({ content: "Incidents can only be submitted inside a server.", ephemeral: true });
     return;
@@ -1248,6 +1241,11 @@ async function submitIncidentDraft(interaction: ButtonInteraction, draft: Requir
 
 async function handleFollowUpModal(interaction: ModalSubmitInteraction): Promise<void> {
   const [, id] = interaction.customId.split(":");
+  if (!id) {
+    await interaction.reply({ content: "That follow-up form is missing an incident ID.", ephemeral: Boolean(interaction.guildId) });
+    return;
+  }
+
   const incident = await getIncident(id);
 
   if (!incident) {
@@ -1447,7 +1445,7 @@ async function refreshReviewMessage(incident: Incident): Promise<void> {
       const message = await (channel as TextChannel).messages.fetch(incident.reviewMessageId);
       await message.edit({
         embeds: [buildIncidentEmbed(incident)],
-        components: buildReviewActions(incident),
+        components: [],
       });
     }
   }
@@ -1559,19 +1557,18 @@ function parseIntakeCustomId(customId: string): ParsedIntakeCustomId | undefined
 
   const parts = customId.split(":");
   if (parts.length === 2) {
+    if (!parts[1]) {
+      return undefined;
+    }
+
     return { action: parts[1] };
   }
 
-  return { draftId: parts[1], action: parts[2] };
-}
-
-function parseIntakeTextModalCustomId(customId: string): { draftId?: string; field: "video" | "location" | "summary" } {
-  const parts = customId.split(":");
-  if (parts.length === 2) {
-    return { field: parts[1] as "video" | "location" | "summary" };
+  if (!parts[2]) {
+    return undefined;
   }
 
-  return { draftId: parts[1], field: parts[2] as "video" | "location" | "summary" };
+  return { draftId: parts[1], action: parts[2] };
 }
 
 function buildInactiveIntakeEmbed(title: string, description: string): EmbedBuilder {
@@ -1606,16 +1603,14 @@ function getIntakeKey(guildId: string, userId: string): string {
   return `${guildId}:${userId}`;
 }
 
-function isIntakeComplete(draft: IntakeDraft): draft is Required<IntakeDraft> {
+function isIntakeComplete(draft: IntakeDraft): draft is CompleteIntakeDraft {
   const hasImpact = !shouldShowImpactSelect(draft.category) || Boolean(draft.impact);
-  const hasEvidence = !shouldShowEvidenceSelect(draft.category) || Boolean(draft.evidenceReadiness);
   const needsVideo = draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip";
   return Boolean(
       draft.category &&
       draft.reporterGamertag &&
       draft.racePhase &&
       hasImpact &&
-      hasEvidence &&
       (!needsVideo || hasValidEvidenceLink(draft)) &&
       draft.lapOrTime &&
       draft.description,
@@ -1653,13 +1648,11 @@ function getIntakeEmbedColor(draft: IntakeDraft): number {
 function getMissingIntakeItems(draft: IntakeDraft): string[] {
   const missing: string[] = [];
   const hasImpact = !shouldShowImpactSelect(draft.category) || Boolean(draft.impact);
-  const hasEvidence = !shouldShowEvidenceSelect(draft.category) || Boolean(draft.evidenceReadiness);
   const needsVideo = draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip";
 
   if (!draft.category) missing.push("rule area");
   if (!draft.racePhase) missing.push("context");
   if (!hasImpact) missing.push("impact");
-  if (!hasEvidence) missing.push("video status");
   if (!draft.reporterGamertag) missing.push("your gamertag");
   if (needsVideo && !draft.evidenceLink) missing.push("video link");
   if (draft.evidenceLink && !isValidHttpUrl(draft.evidenceLink)) missing.push("valid video link");
@@ -1739,7 +1732,9 @@ function parseDiscordUserIds(value: string): string[] {
   const idPattern = /\b\d{17,20}\b/g;
 
   for (const match of value.matchAll(mentionPattern)) {
-    ids.add(match[1]);
+    if (match[1]) {
+      ids.add(match[1]);
+    }
   }
 
   for (const match of value.matchAll(idPattern)) {

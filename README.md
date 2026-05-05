@@ -126,7 +126,6 @@ Or create a random admin test incident:
    - Rule area
    - Race phase
    - Impact / severity
-   - Video status
 5. Fill out your gamertag, video link, incident time, and description from the intake buttons. Add other involved drivers/gamertags if known.
 7. Confirm the bot posts a review message in the private review channel.
 8. Confirm the bot creates a thread for that incident.

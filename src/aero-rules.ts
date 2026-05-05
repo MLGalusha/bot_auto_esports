@@ -185,7 +185,7 @@ export function shouldShowImpactSelect(category?: string): boolean {
   return category !== "build_livery" && category !== "voice_chat";
 }
 
-export function shouldShowEvidenceSelect(category?: string): boolean {
+export function shouldShowEvidenceSelect(): boolean {
   return false;
 }
 
