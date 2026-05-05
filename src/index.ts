@@ -50,6 +50,7 @@ import {
 import {
   buildIncidentEmbed,
   buildDecisionProposalActions,
+  buildDecisionDraftPreviewEmbed,
   buildLogEmbed,
   buildParticipantDecisionEmbed,
   buildThreadReviewActions,
@@ -401,6 +402,12 @@ function formatFollowUps(incident: Incident, limit: number): string {
   return truncateText(followUps, 1000);
 }
 
+function getLatestUserFollowUp(incident: Incident): Incident["history"][number] | undefined {
+  return incident.history
+    .filter((event) => event.action === "user_response" && event.note)
+    .at(-1);
+}
+
 function formatDiscordTimestamp(isoDate: string): string {
   const seconds = Math.floor(Date.parse(isoDate) / 1000);
   return Number.isFinite(seconds) ? `<t:${seconds}:f>` : isoDate;
@@ -474,6 +481,11 @@ function buildReviewThreadControlContent(incident: Incident): string {
     `**Admin Decision:** ${formatIncidentId(incident.id)} | ${formatStatus(incident.status)}`,
     `Evidence: ${incident.evidenceUrl ?? "No video link submitted."}`,
   ];
+  const latestFollowUp = getLatestUserFollowUp(incident);
+
+  if (latestFollowUp) {
+    lines.push(`Latest follow-up: ${formatDiscordTimestamp(latestFollowUp.createdAt)} from <@${latestFollowUp.actorUserId}>. Review card has the details.`);
+  }
 
   if (incident.decisionDraft) {
     lines.push("A proposed decision is posted below. Edit it or publish it when admins agree.");
@@ -509,6 +521,7 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
     }
 
     await interaction.showModal(buildDecisionDraftModal(id, outcome));
+    await resetDecisionOutcomeSelect(interaction, id);
     return;
   }
 
@@ -604,6 +617,21 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
     embeds: [buildIntakeEmbed(draft)],
     components: buildIntakeComponents(draft),
   });
+}
+
+async function resetDecisionOutcomeSelect(interaction: StringSelectMenuInteraction, id: string): Promise<void> {
+  const incident = await getIncident(id);
+  if (!incident || isFinalIncidentStatus(incident.status)) {
+    return;
+  }
+
+  try {
+    await interaction.message.edit({
+      components: incident.decisionDraft ? buildDecisionProposalActions(incident) : buildThreadReviewActions(incident),
+    });
+  } catch {
+    // Best-effort reset so admins can reopen the same modal after dismissing it.
+  }
 }
 
 async function handleButton(interaction: ButtonInteraction): Promise<void> {
@@ -851,9 +879,6 @@ function buildDecisionDraftModal(id: string, outcome: IncidentDecisionOutcome): 
 
   if (outcome === "no_action") {
     modal.addComponents(
-      new ActionRowBuilder<TextInputBuilder>().addComponents(
-        buildDecisionInput("rule", "Finding", "Example: Racing incident / insufficient evidence / no rule breach", TextInputStyle.Short),
-      ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         buildDecisionInput("summary", "Decision wording for drivers", "Explain why no action will be taken.", TextInputStyle.Paragraph),
       ),
@@ -1268,6 +1293,7 @@ async function handleFollowUpModal(interaction: ModalSubmitInteraction): Promise
   const updated = await addUserFollowUp(id, interaction.user.id, note);
   const latestIncident = updated ?? incident;
   await refreshReviewMessage(latestIncident);
+  await notifyReviewThreadOfFollowUp(latestIncident, interaction.user.id);
 
   if (interaction.isFromMessage()) {
     const incidents = interaction.guildId
@@ -1288,6 +1314,29 @@ async function handleFollowUpModal(interaction: ModalSubmitInteraction): Promise
   });
 }
 
+async function notifyReviewThreadOfFollowUp(incident: Incident, actorUserId: string): Promise<void> {
+  if (!incident.reviewThreadId) {
+    return;
+  }
+
+  const thread = await client.channels.fetch(incident.reviewThreadId);
+  if (!thread?.isThread()) {
+    return;
+  }
+
+  const roleMention = config.stewardRoleId ? `<@&${config.stewardRoleId}> ` : "";
+  const message = await thread.send({
+    content: `${roleMention}New follow-up on ${formatIncidentId(incident.id)} from <@${actorUserId}>. Review card updated.`,
+    allowedMentions: config.stewardRoleId
+      ? { roles: [config.stewardRoleId], users: [] }
+      : { parse: [], users: [], roles: [] },
+  });
+
+  setTimeout(() => {
+    void message.delete().catch(() => undefined);
+  }, 60_000);
+}
+
 async function saveDecisionDraft(
   interaction: ModalSubmitInteraction,
   id: string,
@@ -1305,9 +1354,9 @@ async function saveDecisionDraft(
     createdByUserId: existing?.decisionDraft?.createdByUserId ?? interaction.user.id,
     updatedByUserId: interaction.user.id,
     updatedAt: now,
-    driver: getOptionalModalTextValue(interaction, "driver").trim() || undefined,
-    rule: getOptionalModalTextValue(interaction, "rule").trim() || undefined,
-    penalty: getOptionalModalTextValue(interaction, "penalty").trim() || undefined,
+    driver: outcome === "penalty" ? getOptionalModalTextValue(interaction, "driver").trim() || undefined : undefined,
+    rule: outcome === "penalty" ? getOptionalModalTextValue(interaction, "rule").trim() || undefined : undefined,
+    penalty: outcome === "penalty" ? getOptionalModalTextValue(interaction, "penalty").trim() || undefined : undefined,
     summary: interaction.fields.getTextInputValue("summary").trim(),
     internalNote: getOptionalModalTextValue(interaction, "internal_note").trim() || undefined,
   };
@@ -1353,20 +1402,15 @@ async function upsertDecisionProposalMessage(incident: Incident): Promise<void> 
     return;
   }
 
-  const content = [
-    `**Proposed Decision for ${formatIncidentId(incident.id)}**`,
-    `Prepared by <@${incident.decisionDraft.updatedByUserId}>`,
-    "",
-    formatDecisionDraftForParticipants(incident.decisionDraft),
-    "",
-    "Admins can discuss this wording in the thread. Publish only when this is ready to send to drivers.",
-  ].join("\n");
+  const content = `Prepared by <@${incident.decisionDraft.updatedByUserId}>`;
+  const embeds = [buildDecisionDraftPreviewEmbed(incident)];
 
   if (incident.reviewDecisionMessageId) {
     try {
       const message = await thread.messages.fetch(incident.reviewDecisionMessageId);
       await message.edit({
         content,
+        embeds,
         components: buildDecisionProposalActions(incident),
       });
       return;
@@ -1377,6 +1421,7 @@ async function upsertDecisionProposalMessage(incident: Incident): Promise<void> 
 
   const message = await thread.send({
     content,
+    embeds,
     components: buildDecisionProposalActions(incident),
   });
 
@@ -1432,8 +1477,8 @@ async function finalizeIncident(interaction: ButtonInteraction, id: string): Pro
   }
 
   await interaction.update({
-    content: `${formatIncidentId(incident.id)} finalized as ${formatStatus(incident.status)}.`,
-    embeds: [],
+    content: "",
+    embeds: [buildParticipantDecisionEmbed(incident)],
     components: [],
   });
 }

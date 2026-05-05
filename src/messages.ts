@@ -3,6 +3,8 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
   type APIEmbedField,
 } from "discord.js";
 import {
@@ -26,27 +28,38 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     return buildFinalReviewEmbed(incident);
   }
 
+  const reporter = [`Discord: <@${incident.submitterUserId}>`, `Gamertag: ${incident.reporterGamertag ?? "Not provided"}`].join("\n");
+  const incidentDetails = [
+    `Rule Area: ${getIncidentCategoryLabel(incident.category ?? "other")}`,
+    `Context: ${getRacePhaseLabel(incident.racePhase)}`,
+    `Impact: ${getIncidentImpactLabel(incident.impact)}`,
+  ].join("\n");
+  const timing = [`Submitted: ${formatDiscordTimestamp(incident.createdAt)}`, `Incident Time: ${incident.lapOrTime}`].join("\n");
   const fields: APIEmbedField[] = [
-    { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
-    { name: "Reporter", value: `<@${incident.submitterUserId}>`, inline: true },
-    { name: "Status", value: formatStatus(incident.status), inline: true },
-    { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
-    { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
-    { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
-    { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
-    { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
+    { name: "Reporter", value: truncateEmbedFieldValue(reporter), inline: true },
+    { name: "Incident", value: truncateEmbedFieldValue(incidentDetails), inline: true },
+    { name: "Timeline", value: truncateEmbedFieldValue(timing), inline: true },
+    { name: "Evidence", value: truncateEmbedFieldValue(formatEvidenceLink(incident.evidenceUrl)), inline: false },
     {
       name: "Other Drivers",
       value: truncateEmbedFieldValue(formatOtherDrivers(incident)),
       inline: false,
     },
-    { name: "Description", value: truncateEmbedFieldValue(incident.description), inline: false },
+    { name: "Report Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
   ];
 
-  const followUps = formatFollowUps(incident, 5);
-  if (followUps) {
-    fields.push({ name: "Follow-Ups", value: followUps, inline: false });
+  const latestFollowUp = getUserFollowUps(incident).at(-1);
+  if (latestFollowUp) {
+    fields.push({
+      name: "Newest Follow-Up",
+      value: truncateEmbedFieldValue(formatFollowUp(latestFollowUp, 420)),
+      inline: false,
+    });
+  }
+
+  const previousFollowUps = formatFollowUps(incident, 4, latestFollowUp?.createdAt);
+  if (previousFollowUps) {
+    fields.push({ name: "Previous Follow-Ups", value: previousFollowUps, inline: false });
   }
 
   if (incident.finalDecision) {
@@ -74,7 +87,7 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)} Review`)
     .setColor(statusColor(incident.status))
-    .setDescription("Discuss in the thread. The card updates when an official decision is published.")
+    .setDescription(`**${formatStatus(incident.status)}**\nDiscuss in the thread. Follow-ups and decisions update this card.`)
     .addFields(fields)
     .setTimestamp(null);
 }
@@ -86,22 +99,21 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
   }
 
   const fields: APIEmbedField[] = [
-    { name: "Outcome", value: formatDecisionOutcome(decision.outcome), inline: true },
     { name: "Published", value: formatDiscordTimestamp(decision.finalizedAt), inline: true },
     { name: "Published By", value: `<@${decision.finalizedByUserId}>`, inline: true },
   ];
 
-  if (decision.driver) {
+  if (decision.outcome === "penalty" && decision.driver) {
     fields.push({ name: "Driver", value: decision.driver, inline: true });
   }
-  if (decision.penalty) {
+  if (decision.outcome === "penalty" && decision.penalty) {
     fields.push({ name: "Penalty", value: decision.penalty, inline: true });
   }
-  if (decision.rule) {
+  if (decision.outcome === "penalty" && decision.rule) {
     fields.push({ name: "Finding / Rule", value: decision.rule, inline: false });
   }
 
-  fields.push({ name: "Official Decision", value: truncateEmbedFieldValue(decision.summary), inline: false });
+  fields.push({ name: getDecisionSummaryFieldName(decision.outcome), value: truncateEmbedFieldValue(decision.summary), inline: false });
 
   if (decision.internalNote) {
     fields.push({ name: "Internal Admin Note", value: truncateEmbedFieldValue(decision.internalNote), inline: false });
@@ -125,27 +137,22 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)} Final Decision`)
     .setColor(statusColor(incident.status))
-    .setDescription("Official ruling has been published to the involved drivers.")
+    .setDescription(`**${formatDecisionOutcome(decision.outcome)}**\nOfficial ruling has been published to the involved drivers.`)
     .addFields(fields)
     .setTimestamp(new Date(decision.finalizedAt));
 }
 
-export function buildThreadReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
-  const decisionButton = new ButtonBuilder()
-    .setCustomId(`incident-decision:start:${incident.id}`)
-    .setLabel(incident.decisionDraft ? "Edit Decision" : "Make Decision")
-    .setStyle(ButtonStyle.Primary)
-    .setDisabled(isFinalStatus(incident.status));
-
-  const buttons = [decisionButton];
-  if (incident.evidenceUrl) {
-    buttons.push(new ButtonBuilder().setLabel("Open Video").setStyle(ButtonStyle.Link).setURL(incident.evidenceUrl));
+export function buildThreadReviewActions(incident: Incident) {
+  if (incident.decisionDraft || isFinalStatus(incident.status)) {
+    return [];
   }
 
-  return [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)];
+  return [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(buildDecisionOutcomeSelect(incident.id, "Make decision")),
+  ];
 }
 
-export function buildDecisionProposalActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
+export function buildDecisionProposalActions(incident: Incident) {
   return [
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
@@ -153,29 +160,45 @@ export function buildDecisionProposalActions(incident: Incident): ActionRowBuild
         .setLabel("Publish Decision")
         .setStyle(ButtonStyle.Success)
         .setDisabled(!incident.decisionDraft || isFinalStatus(incident.status)),
-      new ButtonBuilder()
-        .setCustomId(`incident-decision:start:${incident.id}`)
-        .setLabel("Edit")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(isFinalStatus(incident.status)),
     ),
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(buildDecisionOutcomeSelect(incident.id, "Change outcome / edit wording").setDisabled(isFinalStatus(incident.status))),
   ];
+}
+
+function buildDecisionOutcomeSelect(incidentId: string, placeholder: string): StringSelectMenuBuilder {
+  return new StringSelectMenuBuilder()
+    .setCustomId(`decision-outcome:${incidentId}`)
+    .setPlaceholder(placeholder)
+    .addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel("Need More Info")
+        .setDescription("Ask drivers for more evidence or clarification.")
+        .setValue("need_more_info"),
+      new StringSelectMenuOptionBuilder()
+        .setLabel("No Action")
+        .setDescription("Publish a no-action ruling.")
+        .setValue("no_action"),
+      new StringSelectMenuOptionBuilder()
+        .setLabel("Penalty")
+        .setDescription("Publish a penalty ruling.")
+        .setValue("penalty"),
+    );
 }
 
 export function formatDecisionDraft(draft: IncidentDecisionDraft, audience: "admin" | "driver" = "driver"): string {
   const lines = [`Outcome: **${formatDecisionOutcome(draft.outcome)}**`];
 
-  if (draft.driver) {
+  if (draft.outcome === "penalty" && draft.driver) {
     lines.push(`Driver: ${draft.driver}`);
   }
-  if (draft.rule) {
+  if (draft.outcome === "penalty" && draft.rule) {
     lines.push(`Rule: ${draft.rule}`);
   }
-  if (draft.penalty) {
+  if (draft.outcome === "penalty" && draft.penalty) {
     lines.push(`Penalty: ${draft.penalty}`);
   }
 
-  lines.push(`Summary: ${draft.summary}`);
+  lines.push(`${getDecisionSummaryLabel(draft.outcome)}: ${draft.summary}`);
 
   if (audience === "admin" && draft.internalNote) {
     lines.push(`Internal: ${draft.internalNote}`);
@@ -201,17 +224,17 @@ export function buildParticipantDecisionEmbed(incident: Incident): EmbedBuilder 
     );
 
   if (decision) {
-    if (decision.driver) {
+    if (decision.outcome === "penalty" && decision.driver) {
       embed.addFields({ name: "Driver", value: decision.driver, inline: true });
     }
-    if (decision.penalty) {
+    if (decision.outcome === "penalty" && decision.penalty) {
       embed.addFields({ name: "Penalty", value: decision.penalty, inline: true });
     }
-    if (decision.rule) {
+    if (decision.outcome === "penalty" && decision.rule) {
       embed.addFields({ name: "Finding / Rule", value: decision.rule, inline: false });
     }
 
-    embed.addFields({ name: "Decision", value: truncateEmbedFieldValue(decision.summary), inline: false });
+    embed.addFields({ name: getDecisionSummaryFieldName(decision.outcome), value: truncateEmbedFieldValue(decision.summary), inline: false });
   } else if (incident.decisionNote) {
     embed.addFields({ name: "Decision", value: truncateEmbedFieldValue(incident.decisionNote), inline: false });
   }
@@ -228,6 +251,27 @@ export function buildParticipantDecisionEmbed(incident: Incident): EmbedBuilder 
   return embed;
 }
 
+export function buildDecisionDraftPreviewEmbed(incident: Incident): EmbedBuilder {
+  const draft = incident.decisionDraft;
+  if (!draft) {
+    return buildParticipantDecisionEmbed(incident);
+  }
+
+  const previewIncident: Incident = {
+    ...incident,
+    status: draft.outcome,
+    finalDecision: {
+      ...draft,
+      finalizedByUserId: draft.updatedByUserId,
+      finalizedAt: draft.updatedAt,
+    },
+  };
+
+  return buildParticipantDecisionEmbed(previewIncident)
+    .setTitle(`Incident ${formatIncidentId(incident.id)} Proposed Decision`)
+    .setDescription("Admins can discuss this wording in the thread. Publish only when this is ready to send to drivers.");
+}
+
 function formatDecisionOutcome(outcome: IncidentDecisionDraft["outcome"]): string {
   switch (outcome) {
     case "need_more_info":
@@ -236,6 +280,27 @@ function formatDecisionOutcome(outcome: IncidentDecisionDraft["outcome"]): strin
       return "No Action";
     case "penalty":
       return "Penalty";
+  }
+}
+
+function getDecisionSummaryFieldName(outcome: IncidentDecisionDraft["outcome"]): string {
+  switch (outcome) {
+    case "need_more_info":
+      return "Requested Info";
+    case "no_action":
+      return "Decision";
+    case "penalty":
+      return "Decision";
+  }
+}
+
+function getDecisionSummaryLabel(outcome: IncidentDecisionDraft["outcome"]): string {
+  switch (outcome) {
+    case "need_more_info":
+      return "Requested Info";
+    case "no_action":
+    case "penalty":
+      return "Decision";
   }
 }
 
@@ -259,15 +324,27 @@ export function truncateEmbedFieldValue(value: string): string {
   return truncateText(value || "\u200b", embedFieldValueMaxLength);
 }
 
-function formatFollowUps(incident: Incident, limit: number): string {
-  const followUps = incident.history
-    .filter((event) => event.action === "user_response" && event.note)
+function getUserFollowUps(incident: Incident) {
+  return incident.history.filter((event) => event.action === "user_response" && event.note);
+}
+
+function formatFollowUp(event: ReturnType<typeof getUserFollowUps>[number], maxNoteLength: number): string {
+  return `${formatDiscordTimestamp(event.createdAt)} <@${event.actorUserId}>: ${truncateText(event.note ?? "", maxNoteLength)}`;
+}
+
+function formatFollowUps(incident: Incident, limit: number, excludeCreatedAt?: string): string {
+  const followUps = getUserFollowUps(incident)
+    .filter((event) => event.createdAt !== excludeCreatedAt)
     .slice(-limit)
     .reverse()
-    .map((event) => `${formatDiscordTimestamp(event.createdAt)} <@${event.actorUserId}>: ${truncateText(event.note ?? "", 280)}`)
+    .map((event) => formatFollowUp(event, 280))
     .join("\n\n");
 
   return truncateText(followUps, 1000);
+}
+
+function formatEvidenceLink(evidenceUrl?: string): string {
+  return evidenceUrl ? `[Open video](${evidenceUrl})\n${evidenceUrl}` : "Not provided";
 }
 
 export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
