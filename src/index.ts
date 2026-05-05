@@ -25,6 +25,7 @@ import {
 } from "discord.js";
 import {
   getDefaultIntakeValues,
+  getEvidenceReadinessLabel,
   getIncidentCategoryLabel,
   getIncidentImpactLabel,
   getIncidentImpactOptions,
@@ -90,6 +91,30 @@ type CompleteIntakeDraft = IntakeDraft & {
 };
 
 const intakeDrafts = new Map<string, IntakeDraft>();
+
+type PenaltySetupDraft = {
+  incidentId: string;
+  userId: string;
+  selectedDrivers: string[];
+  selectedRule?: string | undefined;
+  createdAt: number;
+};
+
+const penaltySetupDrafts = new Map<string, PenaltySetupDraft>();
+
+const penaltyRuleOptions = [
+  { value: "avoidable_contact", label: "Avoidable / excessive contact", description: "Intentional or excessive collisions, ramming, or reckless contact." },
+  { value: "track_limits", label: "Track limits abuse", description: "Intentional or excessive track extension." },
+  { value: "blue_flag", label: "Blue flag violation", description: "Backmarker failed to safely let lead cars pass." },
+  { value: "unsafe_rejoin", label: "Unsafe rejoin / spin recovery", description: "Returned to track or turned around without waiting for a safe gap." },
+  { value: "caution", label: "Yellow flag / caution violation", description: "Passing, careless driving, position changes, or unsafe behavior under caution." },
+  { value: "start_restart", label: "Start / restart procedure", description: "Pace lap, formation, speed, or green flag procedure issue." },
+  { value: "pit_exit", label: "Pit exit violation", description: "Crossed pit exit line or merged unsafely." },
+  { value: "build_livery", label: "Build / handicap / livery", description: "Incorrect car build, group bucket handicap, or required livery." },
+  { value: "voice_conduct", label: "Voice / conduct issue", description: "Arguing, verbal abuse, loud music, or chat disturbance." },
+  { value: "competitive_integrity", label: "Cheating / exploit", description: "Hacking, cheating, exploit use, or intentional rule abuse." },
+  { value: "custom", label: "Other / custom rule", description: "Write a custom rule or standard in the modal." },
+] as const;
 
 type ParsedIntakeCustomId = {
   draftId?: string | undefined;
@@ -321,23 +346,22 @@ function buildIncidentListComponents(
 function buildStatusEmbed(incident: Incident): EmbedBuilder {
   if (incident.finalDecision) {
     return buildParticipantDecisionEmbed(incident)
-      .setDescription("Official decision published by the admin team.");
+      .setDescription(`**${formatStatus(incident.status)}**\nOfficial decision from the admin team.`);
   }
 
   const embed = new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)}`)
     .setColor(0x2563eb)
-    .setDescription(`**${formatStatus(incident.status)}**`)
+    .setDescription(`**${formatStatus(incident.status)}**\nUse Add Follow-Up if admins need more context or you have more evidence.`)
     .addFields(
-      { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
+      { name: "Report", value: truncateEmbedFieldValue(incident.description), inline: false },
       { name: "Rule Area", value: getIncidentCategoryLabel(incident.category), inline: true },
-      { name: "Your Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
-      { name: "Time", value: incident.lapOrTime, inline: true },
-      { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
-      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
-      { name: "Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
+      { name: "Incident Time", value: incident.lapOrTime, inline: true },
+      { name: "Your Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
+      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident).replace(/\n/g, ", ")), inline: false },
+      { name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
     )
     .setTimestamp(new Date());
 
@@ -520,8 +544,19 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
       return;
     }
 
+    if (outcome === "penalty") {
+      await showPenaltySetup(interaction, id);
+      await resetDecisionOutcomeSelect(interaction, id);
+      return;
+    }
+
     await interaction.showModal(buildDecisionDraftModal(id, outcome));
     await resetDecisionOutcomeSelect(interaction, id);
+    return;
+  }
+
+  if (interaction.customId.startsWith("penalty-setup:")) {
+    await handlePenaltySetupSelect(interaction);
     return;
   }
 
@@ -631,6 +666,71 @@ async function resetDecisionOutcomeSelect(interaction: StringSelectMenuInteracti
     });
   } catch {
     // Best-effort reset so admins can reopen the same modal after dismissing it.
+  }
+}
+
+async function showPenaltySetup(interaction: StringSelectMenuInteraction, id: string): Promise<void> {
+  const incident = await getIncident(id);
+  if (!incident) {
+    await interaction.reply({ content: `I could not find incident ${formatIncidentId(id)}.`, ephemeral: true });
+    return;
+  }
+
+  if (isFinalIncidentStatus(incident.status)) {
+    await interaction.reply({ content: "This incident already has a published final decision.", ephemeral: true });
+    return;
+  }
+
+  const draft = createPenaltySetupDraft(incident, interaction.user.id);
+  await interaction.reply({
+    ephemeral: true,
+    embeds: [buildPenaltySetupEmbed(incident, draft)],
+    components: buildPenaltySetupComponents(incident, draft),
+  });
+}
+
+async function handlePenaltySetupSelect(interaction: StringSelectMenuInteraction): Promise<void> {
+  if (!canModerate(interaction.member, interaction.memberPermissions)) {
+    await interaction.reply({ content: "Only admins can update penalty setup.", ephemeral: true });
+    return;
+  }
+
+  const [, field, id] = interaction.customId.split(":");
+  if (!field || !id) {
+    await interaction.reply({ content: "That penalty setup action is missing an incident ID.", ephemeral: true });
+    return;
+  }
+
+  const incident = await getIncident(id);
+  if (!incident) {
+    await interaction.reply({ content: `I could not find incident ${formatIncidentId(id)}.`, ephemeral: true });
+    return;
+  }
+
+  const draft = getPenaltySetupDraft(incident, interaction.user.id);
+  if (field === "drivers") {
+    draft.selectedDrivers = interaction.values;
+  } else if (field === "rule") {
+    draft.selectedRule = interaction.values[0] || undefined;
+  }
+
+  penaltySetupDrafts.set(getPenaltySetupKey(incident.id, interaction.user.id), draft);
+  await interaction.update({
+    embeds: [buildPenaltySetupEmbed(incident, draft)],
+    components: buildPenaltySetupComponents(incident, draft),
+  });
+}
+
+async function handlePenaltySetupButton(interaction: ButtonInteraction, action: string, id: string): Promise<void> {
+  const incident = await getIncident(id);
+  if (!incident) {
+    await interaction.reply({ content: `I could not find incident ${formatIncidentId(id)}.`, ephemeral: true });
+    return;
+  }
+
+  if (action === "continue") {
+    const draft = getPenaltySetupDraft(incident, interaction.user.id);
+    await interaction.showModal(buildDecisionDraftModal(incident.id, "penalty", draft));
   }
 }
 
@@ -788,6 +888,11 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
+  if (scope === "penalty-setup") {
+    await handlePenaltySetupButton(interaction, action, id);
+    return;
+  }
+
   if (
     scope === "incident-admin" ||
     scope === "incident-vote" ||
@@ -851,18 +956,21 @@ async function showDecisionOutcomePicker(interaction: ButtonInteraction, id: str
   });
 }
 
-function buildDecisionDraftModal(id: string, outcome: IncidentDecisionOutcome): ModalBuilder {
+function buildDecisionDraftModal(id: string, outcome: IncidentDecisionOutcome, penaltySetup?: PenaltySetupDraft): ModalBuilder {
   const modal = new ModalBuilder()
     .setCustomId(`incident-draft-modal:${outcome}:${id}`)
     .setTitle(`${decisionDraftTitle(outcome)} ${formatIncidentId(id)}`);
 
   if (outcome === "penalty") {
+    const selectedRule = penaltySetup?.selectedRule && penaltySetup.selectedRule !== "custom"
+      ? getPenaltyRuleLabel(penaltySetup.selectedRule)
+      : "";
     modal.addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        buildDecisionInput("driver", "Driver receiving penalty", "Example: DriverBravo / @DriverBravo", TextInputStyle.Short),
+        buildDecisionInput("driver", "Driver(s) receiving penalty", ["DriverBravo", "ApexShift7"].join("\n"), TextInputStyle.Paragraph, true, penaltySetup?.selectedDrivers.join("\n")),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
-        buildDecisionInput("rule", "Rule or standard violated", "Example: Avoidable contact entering Turn 1", TextInputStyle.Short),
+        buildDecisionInput("rule", "Rule or standard violated", "Example: Avoidable contact entering Turn 1", TextInputStyle.Short, true, selectedRule),
       ),
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         buildDecisionInput("penalty", "Penalty", "Example: 5-second post-race penalty", TextInputStyle.Short),
@@ -906,14 +1014,160 @@ function buildDecisionInput(
   placeholder: string,
   style: TextInputStyle,
   required = true,
+  value?: string,
 ): TextInputBuilder {
-  return new TextInputBuilder()
+  const input = new TextInputBuilder()
     .setCustomId(customId)
     .setLabel(label)
     .setPlaceholder(placeholder)
     .setStyle(style)
     .setMaxLength(style === TextInputStyle.Short ? 120 : 1000)
     .setRequired(required);
+
+  if (value) {
+    input.setValue(value.slice(0, style === TextInputStyle.Short ? 120 : 1000));
+  }
+
+  return input;
+}
+
+function buildPenaltySetupEmbed(incident: Incident, draft: PenaltySetupDraft): EmbedBuilder {
+  const driverSummary = draft.selectedDrivers.length > 0 ? draft.selectedDrivers.join("\n") : "Leave blank and type driver name(s) in the modal.";
+  const ruleSummary = draft.selectedRule && draft.selectedRule !== "custom" ? getPenaltyRuleLabel(draft.selectedRule) : "Custom / manual entry";
+
+  return new EmbedBuilder()
+    .setTitle(`Penalty Setup ${formatIncidentId(incident.id)}`)
+    .setColor(0xef4444)
+    .setDescription("Optional shortcuts before the penalty modal. The modal stays editable.")
+    .addFields(
+      { name: "Selected Driver(s)", value: truncateEmbedFieldValue(driverSummary), inline: false },
+      { name: "Selected Rule", value: truncateEmbedFieldValue(ruleSummary), inline: false },
+    );
+}
+
+function buildPenaltySetupComponents(incident: Incident, draft: PenaltySetupDraft) {
+  const driverOptions = buildPenaltyDriverOptions(incident, draft);
+
+  const rows: Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`penalty-setup:rule:${incident.id}`)
+        .setPlaceholder("Violated rule / category")
+        .addOptions(buildPenaltyRuleOptions(incident, draft)),
+    ),
+  ];
+
+  if (driverOptions.length > 0) {
+    rows.unshift(
+      new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`penalty-setup:drivers:${incident.id}`)
+          .setPlaceholder("Penalized driver(s)")
+          .setMinValues(0)
+          .setMaxValues(Math.min(driverOptions.length, 25))
+          .addOptions(driverOptions),
+      ),
+    );
+  }
+
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`penalty-setup:continue:${incident.id}`)
+        .setLabel("Continue")
+        .setStyle(ButtonStyle.Primary),
+    ),
+  );
+
+  return rows;
+}
+
+function buildPenaltyDriverOptions(incident: Incident, draft: PenaltySetupDraft): StringSelectMenuOptionBuilder[] {
+  const labels = new Set<string>();
+  if (incident.reporterGamertag) {
+    labels.add(incident.reporterGamertag);
+  }
+  for (const userId of incident.involvedUserIds) {
+    labels.add(`<@${userId}>`);
+  }
+  for (const driver of incident.involvedDriversText.split(/[\n,]+/).map((value) => value.trim()).filter(Boolean)) {
+    labels.add(driver);
+  }
+
+  return Array.from(labels).slice(0, 25).map((label) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(truncateText(label.replace(/[<>@]/g, ""), 100))
+      .setValue(truncateText(label, 100))
+      .setDefault(draft.selectedDrivers.includes(truncateText(label, 100))),
+  );
+}
+
+function buildPenaltyRuleOptions(incident: Incident, draft: PenaltySetupDraft): StringSelectMenuOptionBuilder[] {
+  const selectedRule = draft.selectedRule ?? getDefaultPenaltyRuleValue(incident);
+  return penaltyRuleOptions.map((rule) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(rule.label)
+      .setDescription(truncateText(rule.description, 100))
+      .setValue(rule.value)
+      .setDefault(selectedRule === rule.value),
+  );
+}
+
+function createPenaltySetupDraft(incident: Incident, userId: string): PenaltySetupDraft {
+  const draft: PenaltySetupDraft = {
+    incidentId: incident.id,
+    userId,
+    selectedDrivers: [],
+    selectedRule: getDefaultPenaltyRuleValue(incident),
+    createdAt: Date.now(),
+  };
+  penaltySetupDrafts.set(getPenaltySetupKey(incident.id, userId), draft);
+  return draft;
+}
+
+function getPenaltySetupDraft(incident: Incident, userId: string): PenaltySetupDraft {
+  const key = getPenaltySetupKey(incident.id, userId);
+  const draft = penaltySetupDrafts.get(key);
+  if (draft) {
+    return draft;
+  }
+
+  return createPenaltySetupDraft(incident, userId);
+}
+
+function getPenaltySetupKey(incidentId: string, userId: string): string {
+  return `${incidentId}:${userId}`;
+}
+
+function getPenaltyRuleLabel(value: string): string {
+  return penaltyRuleOptions.find((rule) => rule.value === value)?.label ?? getIncidentCategoryLabel(value);
+}
+
+function getDefaultPenaltyRuleValue(incident: Incident): string {
+  switch (incident.category) {
+    case "collision":
+      return "avoidable_contact";
+    case "track_limits":
+      return "track_limits";
+    case "blue_flag":
+      return "blue_flag";
+    case "reentry":
+      return "unsafe_rejoin";
+    case "yellow_flag":
+      return "caution";
+    case "race_procedure":
+      return "start_restart";
+    case "pit_exit":
+      return "pit_exit";
+    case "build_livery":
+      return "build_livery";
+    case "competitive_integrity":
+      return "competitive_integrity";
+    case "voice_chat":
+      return "voice_conduct";
+    default:
+      return "custom";
+  }
 }
 
 function decisionDraftTitle(outcome: IncidentDecisionOutcome): string {
@@ -952,7 +1206,7 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
 }
 
 function buildIntakeEmbed(draft: IntakeDraft): EmbedBuilder {
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setTitle("AERO Incident Intake")
     .setColor(getIntakeEmbedColor(draft))
     .setDescription(
@@ -962,19 +1216,28 @@ function buildIntakeEmbed(draft: IntakeDraft): EmbedBuilder {
         "",
         "Evidence should show a few seconds before and after the incident when possible.",
       ].join("\n"),
-    )
-    .addFields(
-      { name: "Rules Selected", value: "\u200b", inline: false },
-      { name: "Rule Area", value: getIncidentCategoryLabel(draft.category ?? "Not selected"), inline: true },
-      { name: "Context", value: getRacePhaseLabel(draft.racePhase), inline: true },
-      { name: "Impact", value: getIncidentImpactLabel(draft.impact), inline: true },
-      { name: "Report Details", value: "\u200b", inline: false },
-      { name: "Your Gamertag", value: draft.reporterGamertag ?? "Not added", inline: true },
-      { name: "Video Link", value: truncateEmbedFieldValue(formatDraftVideoLinkStatus(draft)), inline: true },
-      { name: "Time", value: draft.lapOrTime ?? "Not added", inline: true },
-      { name: "Other Drivers", value: truncateEmbedFieldValue(formatDraftDrivers(draft)), inline: false },
-      { name: "Summary", value: truncateEmbedFieldValue(draft.description ?? "Not added"), inline: false },
     );
+
+  if (draft.description) {
+    embed.addFields({ name: "Report", value: truncateEmbedFieldValue(draft.description), inline: false });
+  }
+
+  embed.addFields(buildIntakeDetailFields(draft));
+
+  const evidence = formatIntakeEvidence(draft);
+  if (evidence) {
+    embed.addFields({ name: "Evidence", value: truncateEmbedFieldValue(evidence), inline: false });
+  }
+
+  if (embed.data.fields?.length === 0) {
+    embed.addFields({
+      name: "Start Here",
+      value: "Choose a rule area and context, then use Details to add the report text, driver names, time, and evidence.",
+      inline: false,
+    });
+  }
+
+  return embed;
 }
 
 function buildIntakeComponents(draft: IntakeDraft): ActionRowBuilder<StringSelectMenuBuilder | ButtonBuilder>[] {
@@ -1017,10 +1280,11 @@ function buildSelectRow(
   selectedValue?: string,
   disabled = false,
 ): ActionRowBuilder<StringSelectMenuBuilder> {
+  const selectedOption = options.find((option) => option.value === selectedValue);
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(customId)
-      .setPlaceholder(disabled ? "Select rule area first" : selectedValue ? `${placeholder}: selected` : `Select ${placeholder.toLowerCase()}`)
+      .setPlaceholder(disabled ? "Select rule area first" : selectedOption ? `${placeholder}: ${selectedOption.label}` : `Select ${placeholder.toLowerCase()}`)
       .setDisabled(disabled)
       .addOptions(
         options.map((option) =>
@@ -1042,7 +1306,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const reporterGamertag = new TextInputBuilder()
     .setCustomId("reporter_gamertag")
     .setLabel("Your gamertag")
-    .setPlaceholder("Your gamertag")
+    .setPlaceholder("AERO_Test_Taylor")
     .setStyle(TextInputStyle.Short)
     .setMaxLength(80)
     .setRequired(true);
@@ -1054,7 +1318,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const drivers = new TextInputBuilder()
     .setCustomId("drivers")
     .setLabel("Other drivers, one per line")
-    .setPlaceholder(["GridRunner88", "ApexShift7", "TrackLimit24"].join("\n"))
+    .setPlaceholder(["AERO_Test_Harbor", "AERO_Test_Mica"].join("\n"))
     .setStyle(TextInputStyle.Paragraph)
     .setMaxLength(1000)
     .setRequired(false);
@@ -1066,7 +1330,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const evidenceLink = new TextInputBuilder()
     .setCustomId("evidence_link")
     .setLabel("Video link")
-    .setPlaceholder("Paste video URL")
+    .setPlaceholder("https://www.youtube.com/watch?v=...")
     .setStyle(TextInputStyle.Short)
     .setMaxLength(500)
     .setRequired(draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip");
@@ -1078,7 +1342,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const lapOrTime = new TextInputBuilder()
     .setCustomId("lap_or_time")
     .setLabel("Time in video")
-    .setPlaceholder("0:42 in clip, Lap 12, T1")
+    .setPlaceholder("Lap 2, Turn 1 / 0:42 in clip")
     .setStyle(TextInputStyle.Short)
     .setMaxLength(140)
     .setRequired(true);
@@ -1090,7 +1354,7 @@ function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const summary = new TextInputBuilder()
     .setCustomId("summary")
     .setLabel("What happened?")
-    .setPlaceholder("Short summary for admins")
+    .setPlaceholder("Describe what happened, who was affected, and why admins should review it.")
     .setStyle(TextInputStyle.Paragraph)
     .setMaxLength(1000)
     .setRequired(true);
@@ -1324,12 +1588,9 @@ async function notifyReviewThreadOfFollowUp(incident: Incident, actorUserId: str
     return;
   }
 
-  const roleMention = config.stewardRoleId ? `<@&${config.stewardRoleId}> ` : "";
   const message = await thread.send({
-    content: `${roleMention}New follow-up on ${formatIncidentId(incident.id)} from <@${actorUserId}>. Review card updated.`,
-    allowedMentions: config.stewardRoleId
-      ? { roles: [config.stewardRoleId], users: [] }
-      : { parse: [], users: [], roles: [] },
+    content: `New follow-up on ${formatIncidentId(incident.id)} from <@${actorUserId}>. Review card updated.`,
+    allowedMentions: { users: [actorUserId], roles: [] },
   });
 
   setTimeout(() => {
@@ -1348,12 +1609,17 @@ async function saveDecisionDraft(
     await interaction.reply({ content: "Finalized incidents cannot be edited. Reopen support can be added separately.", ephemeral: true });
     return;
   }
+  const penaltySetup = existing && outcome === "penalty"
+    ? penaltySetupDrafts.get(getPenaltySetupKey(existing.id, interaction.user.id))
+    : undefined;
 
   const draft: IncidentDecisionDraft = {
     outcome,
     createdByUserId: existing?.decisionDraft?.createdByUserId ?? interaction.user.id,
     updatedByUserId: interaction.user.id,
     updatedAt: now,
+    penalizedDrivers: outcome === "penalty" && penaltySetup?.selectedDrivers.length ? penaltySetup.selectedDrivers : undefined,
+    ruleSelection: outcome === "penalty" && penaltySetup?.selectedRule ? penaltySetup.selectedRule : undefined,
     driver: outcome === "penalty" ? getOptionalModalTextValue(interaction, "driver").trim() || undefined : undefined,
     rule: outcome === "penalty" ? getOptionalModalTextValue(interaction, "rule").trim() || undefined : undefined,
     penalty: outcome === "penalty" ? getOptionalModalTextValue(interaction, "penalty").trim() || undefined : undefined,
@@ -1384,6 +1650,7 @@ async function saveDecisionDraft(
     return;
   }
 
+  penaltySetupDrafts.delete(getPenaltySetupKey(incident.id, interaction.user.id));
   await refreshReviewThreadControlMessage(incident);
   await upsertDecisionProposalMessage(incident);
   await interaction.reply({
@@ -1678,7 +1945,7 @@ function formatIntakeSubmitStatus(draft: IntakeDraft): string {
 
   return [
     "**Cannot submit yet.**",
-    `Needs: ${missing.join(", ")}.`,
+    `Still needed: ${missing.join(", ")}.`,
   ].join("\n");
 }
 
@@ -1814,6 +2081,31 @@ function formatDraftDrivers(draft: IntakeDraft): string {
   return draft.drivers.map((driver) => `- ${driver}`).join("\n");
 }
 
+function buildIntakeDetailFields(draft: IntakeDraft) {
+  const fields = [];
+
+  if (draft.category) {
+    fields.push({ name: "Rule Area", value: getIncidentCategoryLabel(draft.category), inline: true });
+  }
+  if (draft.racePhase) {
+    fields.push({ name: "Context", value: getRacePhaseLabel(draft.racePhase), inline: true });
+  }
+  if (draft.impact) {
+    fields.push({ name: "Impact", value: getIncidentImpactLabel(draft.impact), inline: true });
+  }
+  if (draft.lapOrTime) {
+    fields.push({ name: "Incident Time", value: draft.lapOrTime, inline: true });
+  }
+  if (draft.reporterGamertag) {
+    fields.push({ name: "Your Gamertag", value: draft.reporterGamertag, inline: true });
+  }
+  if (draft.drivers.length > 0) {
+    fields.push({ name: "Other Drivers", value: truncateEmbedFieldValue(draft.drivers.join("\n")), inline: false });
+  }
+
+  return fields;
+}
+
 function formatDraftVideoLinkStatus(draft: IntakeDraft): string {
   if (!draft.evidenceLink) {
     return "Not added";
@@ -1822,6 +2114,15 @@ function formatDraftVideoLinkStatus(draft: IntakeDraft): string {
   return isValidHttpUrl(draft.evidenceLink)
     ? draft.evidenceLink
     : `Invalid link\n${truncateFieldValue(draft.evidenceLink, 120)}\nUse a full \`https://...\` URL`;
+}
+
+function formatIntakeEvidence(draft: IntakeDraft): string {
+  const evidenceLines = [
+    draft.evidenceReadiness ? getEvidenceReadinessLabel(draft.evidenceReadiness) : undefined,
+    draft.evidenceLink ? formatDraftVideoLinkStatus(draft) : undefined,
+  ].filter(Boolean);
+
+  return evidenceLines.join("\n");
 }
 
 function truncateFieldValue(value: string, maxLength: number): string {

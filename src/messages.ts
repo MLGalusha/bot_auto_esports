@@ -28,38 +28,21 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     return buildFinalReviewEmbed(incident);
   }
 
-  const reporter = [`Discord: <@${incident.submitterUserId}>`, `Gamertag: ${incident.reporterGamertag ?? "Not provided"}`].join("\n");
-  const incidentDetails = [
-    `Rule Area: ${getIncidentCategoryLabel(incident.category ?? "other")}`,
-    `Context: ${getRacePhaseLabel(incident.racePhase)}`,
-    `Impact: ${getIncidentImpactLabel(incident.impact)}`,
-  ].join("\n");
-  const timing = [`Submitted: ${formatDiscordTimestamp(incident.createdAt)}`, `Incident Time: ${incident.lapOrTime}`].join("\n");
   const fields: APIEmbedField[] = [
-    { name: "Reporter", value: truncateEmbedFieldValue(reporter), inline: true },
-    { name: "Incident", value: truncateEmbedFieldValue(incidentDetails), inline: true },
-    { name: "Timeline", value: truncateEmbedFieldValue(timing), inline: true },
+    { name: "Report", value: truncateEmbedFieldValue(incident.description), inline: false },
+    { name: "Reporter", value: truncateEmbedFieldValue(`${incident.reporterGamertag ?? "Not provided"}\n<@${incident.submitterUserId}>`), inline: true },
+    { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
+    { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
+    { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
+    { name: "Incident Time", value: incident.lapOrTime, inline: true },
+    { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
+    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
     { name: "Evidence", value: truncateEmbedFieldValue(formatEvidenceLink(incident.evidenceUrl)), inline: false },
-    {
-      name: "Other Drivers",
-      value: truncateEmbedFieldValue(formatOtherDrivers(incident)),
-      inline: false,
-    },
-    { name: "Report Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
   ];
 
-  const latestFollowUp = getUserFollowUps(incident).at(-1);
-  if (latestFollowUp) {
-    fields.push({
-      name: "Newest Follow-Up",
-      value: truncateEmbedFieldValue(formatFollowUp(latestFollowUp, 420)),
-      inline: false,
-    });
-  }
-
-  const previousFollowUps = formatFollowUps(incident, 4, latestFollowUp?.createdAt);
-  if (previousFollowUps) {
-    fields.push({ name: "Previous Follow-Ups", value: previousFollowUps, inline: false });
+  const followUps = formatFollowUps(incident, 5);
+  if (followUps) {
+    fields.push({ name: "Follow-Ups", value: followUps, inline: false });
   }
 
   if (incident.finalDecision) {
@@ -87,7 +70,7 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)} Review`)
     .setColor(statusColor(incident.status))
-    .setDescription(`**${formatStatus(incident.status)}**\nDiscuss in the thread. Follow-ups and decisions update this card.`)
+    .setDescription(`**${formatStatus(incident.status)}**\nAdmin review card. Use the thread controls to request info or publish a decision.`)
     .addFields(fields)
     .setTimestamp(null);
 }
@@ -98,40 +81,16 @@ function buildFinalReviewEmbed(incident: Incident): EmbedBuilder {
     return buildIncidentEmbed(incident);
   }
 
-  const fields: APIEmbedField[] = [
-    { name: "Published", value: formatDiscordTimestamp(decision.finalizedAt), inline: true },
-    { name: "Published By", value: `<@${decision.finalizedByUserId}>`, inline: true },
-  ];
+  const fields: APIEmbedField[] = buildDecisionFields(incident);
 
-  if (decision.outcome === "penalty" && decision.driver) {
-    fields.push({ name: "Driver", value: decision.driver, inline: true });
-  }
-  if (decision.outcome === "penalty" && decision.penalty) {
-    fields.push({ name: "Penalty", value: decision.penalty, inline: true });
-  }
-  if (decision.outcome === "penalty" && decision.rule) {
-    fields.push({ name: "Finding / Rule", value: decision.rule, inline: false });
-  }
-
-  fields.push({ name: getDecisionSummaryFieldName(decision.outcome), value: truncateEmbedFieldValue(decision.summary), inline: false });
+  fields.push({
+    name: "Published",
+    value: `${formatDiscordTimestamp(decision.finalizedAt)} by <@${decision.finalizedByUserId}>`,
+    inline: false,
+  });
 
   if (decision.internalNote) {
     fields.push({ name: "Internal Admin Note", value: truncateEmbedFieldValue(decision.internalNote), inline: false });
-  }
-
-  fields.push(
-    { name: "Incident Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
-    { name: "Reporter", value: `<@${incident.submitterUserId}>`, inline: true },
-    { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
-    { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
-    { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
-    { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
-    { name: "Original Report", value: truncateEmbedFieldValue(incident.description), inline: false },
-  );
-
-  if (incident.evidenceUrl) {
-    fields.push({ name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl), inline: false });
   }
 
   return new EmbedBuilder()
@@ -216,36 +175,19 @@ export function buildParticipantDecisionEmbed(incident: Incident): EmbedBuilder 
   const embed = new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)} Decision`)
     .setColor(statusColor(incident.status))
-    .setTimestamp(decision ? new Date(decision.finalizedAt) : new Date())
-    .addFields(
-      { name: "Outcome", value: decision ? formatDecisionOutcome(decision.outcome) : formatStatus(incident.status), inline: true },
-      { name: "Incident Time", value: incident.lapOrTime, inline: true },
-      { name: "Rule Area", value: getIncidentCategoryLabel(incident.category), inline: true },
-    );
+    .setTimestamp(decision ? new Date(decision.finalizedAt) : new Date());
 
   if (decision) {
-    if (decision.outcome === "penalty" && decision.driver) {
-      embed.addFields({ name: "Driver", value: decision.driver, inline: true });
-    }
-    if (decision.outcome === "penalty" && decision.penalty) {
-      embed.addFields({ name: "Penalty", value: decision.penalty, inline: true });
-    }
-    if (decision.outcome === "penalty" && decision.rule) {
-      embed.addFields({ name: "Finding / Rule", value: decision.rule, inline: false });
-    }
-
-    embed.addFields({ name: getDecisionSummaryFieldName(decision.outcome), value: truncateEmbedFieldValue(decision.summary), inline: false });
+    embed
+      .setDescription(`**${formatDecisionOutcome(decision.outcome)}**`)
+      .addFields(buildDecisionFields(incident));
   } else if (incident.decisionNote) {
-    embed.addFields({ name: "Decision", value: truncateEmbedFieldValue(incident.decisionNote), inline: false });
-  }
-
-  embed.addFields(
-    { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
-    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
-  );
-
-  if (incident.evidenceUrl) {
-    embed.addFields({ name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl), inline: false });
+    embed
+      .setDescription(`**${formatStatus(incident.status)}**`)
+      .addFields(
+        { name: "Decision", value: truncateEmbedFieldValue(incident.decisionNote), inline: false },
+        ...buildIncidentReferenceFields(incident),
+      );
   }
 
   return embed;
@@ -269,7 +211,58 @@ export function buildDecisionDraftPreviewEmbed(incident: Incident): EmbedBuilder
 
   return buildParticipantDecisionEmbed(previewIncident)
     .setTitle(`Incident ${formatIncidentId(incident.id)} Proposed Decision`)
-    .setDescription("Admins can discuss this wording in the thread. Publish only when this is ready to send to drivers.");
+    .setDescription(`**${formatDecisionOutcome(draft.outcome)}**\nAdmins can discuss this wording in the thread. Publish only when this is ready to send to drivers.`);
+}
+
+function buildDecisionFields(incident: Incident): APIEmbedField[] {
+  const decision = incident.finalDecision;
+  if (!decision) {
+    return [];
+  }
+
+  const fields: APIEmbedField[] = [];
+
+  if (decision.outcome === "penalty") {
+    if (decision.driver) {
+      fields.push({ name: "Penalized Driver(s)", value: truncateEmbedFieldValue(decision.driver), inline: true });
+    }
+    if (decision.penalty) {
+      fields.push({ name: "Penalty", value: truncateEmbedFieldValue(decision.penalty), inline: true });
+    }
+    if (decision.rule && decision.rule !== getIncidentCategoryLabel(incident.category)) {
+      fields.push({ name: "Reason", value: truncateEmbedFieldValue(decision.rule), inline: false });
+    }
+  }
+
+  fields.push(
+    { name: getDecisionSummaryFieldName(decision.outcome), value: truncateEmbedFieldValue(decision.summary), inline: false },
+    ...buildIncidentReferenceFields(incident),
+  );
+
+  if (incident.evidenceUrl) {
+    fields.push({ name: "Evidence", value: truncateEmbedFieldValue(incident.evidenceUrl), inline: false });
+  }
+
+  return fields;
+}
+
+function buildIncidentReferenceFields(incident: Incident): APIEmbedField[] {
+  return [
+    { name: "Incident Time", value: incident.lapOrTime, inline: true },
+    { name: "Rule Area", value: getIncidentCategoryLabel(incident.category), inline: true },
+    { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
+    { name: "Reporter", value: incident.reporterGamertag ?? `<@${incident.submitterUserId}>`, inline: true },
+    { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDriversInline(incident)), inline: true },
+  ];
+}
+
+function formatOtherDriversInline(incident: Incident): string {
+  const otherDrivers = formatOtherDrivers(incident)
+    .split("\n")
+    .map((driver) => driver.trim())
+    .filter(Boolean);
+
+  return otherDrivers.length > 0 ? otherDrivers.join(", ") : "Not provided";
 }
 
 function formatDecisionOutcome(outcome: IncidentDecisionDraft["outcome"]): string {
@@ -332,13 +325,12 @@ function formatFollowUp(event: ReturnType<typeof getUserFollowUps>[number], maxN
   return `${formatDiscordTimestamp(event.createdAt)} <@${event.actorUserId}>: ${truncateText(event.note ?? "", maxNoteLength)}`;
 }
 
-function formatFollowUps(incident: Incident, limit: number, excludeCreatedAt?: string): string {
+function formatFollowUps(incident: Incident, limit: number): string {
   const followUps = getUserFollowUps(incident)
-    .filter((event) => event.createdAt !== excludeCreatedAt)
     .slice(-limit)
     .reverse()
     .map((event) => formatFollowUp(event, 280))
-    .join("\n\n");
+    .join("\n");
 
   return truncateText(followUps, 1000);
 }
@@ -349,19 +341,18 @@ function formatEvidenceLink(evidenceUrl?: string): string {
 
 export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
   return new EmbedBuilder()
-    .setTitle(`Incident ${formatIncidentId(incident.id)}`)
+    .setTitle(`Incident ${formatIncidentId(incident.id)} Submitted`)
     .setColor(0x10b981)
-    .setDescription(`**${formatStatus(incident.status)}**`)
+    .setDescription(`**${formatStatus(incident.status)}**\nYour report is in the admin review queue.`)
     .addFields(
-      { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
-      { name: "Your Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
+      { name: "Report", value: truncateEmbedFieldValue(incident.description), inline: false },
       { name: "Rule Area", value: getIncidentCategoryLabel(incident.category), inline: true },
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
-      { name: "Time", value: incident.lapOrTime, inline: true },
-      { name: "Video Link", value: truncateEmbedFieldValue(incident.evidenceUrl ?? "Not provided"), inline: false },
-      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDrivers(incident)), inline: false },
-      { name: "Summary", value: truncateEmbedFieldValue(incident.description), inline: false },
+      { name: "Incident Time", value: incident.lapOrTime, inline: true },
+      { name: "Your Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
+      { name: "Other Drivers", value: truncateEmbedFieldValue(formatOtherDriversInline(incident)), inline: false },
+      { name: "Evidence", value: truncateEmbedFieldValue(formatEvidenceLink(incident.evidenceUrl)), inline: false },
     )
     .setTimestamp(new Date());
 }

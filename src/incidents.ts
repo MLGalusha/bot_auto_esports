@@ -50,6 +50,8 @@ export type IncidentDecisionDraft = {
   createdByUserId: string;
   updatedByUserId: string;
   updatedAt: string;
+  penalizedDrivers?: string[] | undefined;
+  ruleSelection?: string | undefined;
   driver?: string | undefined;
   rule?: string | undefined;
   penalty?: string | undefined;
