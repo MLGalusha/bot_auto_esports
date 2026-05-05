@@ -16,14 +16,15 @@ import { formatIncidentId, formatStatus, type Incident, type IncidentStatus } fr
 export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
   const fields: APIEmbedField[] = [
     { name: "Submitted", value: formatDiscordTimestamp(incident.createdAt), inline: true },
-    { name: "Last Updated", value: formatDiscordTimestamp(incident.updatedAt), inline: true },
     { name: "Reporter", value: `<@${incident.submitterUserId}>`, inline: true },
+    { name: "Status", value: formatStatus(incident.status), inline: true },
     { name: "Reporter Gamertag", value: incident.reporterGamertag ?? "Not provided", inline: true },
     { name: "Rule Area", value: getIncidentCategoryLabel(incident.category ?? "other"), inline: true },
     { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
     { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
     { name: "Time", value: incident.lapOrTime, inline: true },
-    { name: "Evidence", value: getEvidenceReadinessLabel(incident.evidenceReadiness), inline: true },
+    { name: "Video Status", value: getEvidenceReadinessLabel(incident.evidenceReadiness), inline: true },
+    { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
     {
       name: "Other Drivers",
       value:
@@ -35,12 +36,18 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     { name: "Description", value: incident.description, inline: false },
   ];
 
+  const followUps = formatFollowUps(incident, 5);
+  if (followUps) {
+    fields.push({ name: "Follow-Ups", value: followUps, inline: false });
+  }
+
   if (incident.decisionNote) {
-    fields.push({ name: "Latest Note", value: incident.decisionNote, inline: false });
+    fields.push({ name: "Decision Note", value: incident.decisionNote, inline: false });
   }
 
   const recentTimeline = incident.history
-    .slice(-5)
+    .filter((event) => event.action !== "submitted" && event.action !== "user_response")
+    .slice(-3)
     .reverse()
     .map((event) => {
       const note = event.note ? ` - ${truncateText(event.note, 160)}` : "";
@@ -49,58 +56,61 @@ export function buildIncidentEmbed(incident: Incident): EmbedBuilder {
     .join("\n");
 
   if (recentTimeline) {
-    fields.push({ name: "Recent Activity", value: recentTimeline, inline: false });
+    fields.push({ name: "Admin Activity", value: recentTimeline, inline: false });
   }
 
   return new EmbedBuilder()
-    .setTitle(`Incident ${formatIncidentId(incident.id)}`)
+    .setTitle(`Incident ${formatIncidentId(incident.id)} Review`)
     .setColor(statusColor(incident.status))
-    .setDescription(`**${formatStatus(incident.status)}**`)
+    .setDescription("Review the clip and discussion thread, then choose a decision below.")
     .addFields(fields)
     .setTimestamp(null);
 }
 
 export function buildReviewActions(incident: Incident): ActionRowBuilder<ButtonBuilder>[] {
-  const rows = [
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`incident:under_review:${incident.id}`)
-        .setLabel("Reviewing")
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(false),
-      new ButtonBuilder()
-        .setCustomId(`incident:need_more_info:${incident.id}`)
-        .setLabel("Need Info")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false),
-      new ButtonBuilder()
-        .setCustomId(`incident:no_action:${incident.id}`)
-        .setLabel("No Action")
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false),
-      new ButtonBuilder()
-        .setCustomId(`incident:penalty:${incident.id}`)
-        .setLabel("Penalty")
-        .setStyle(ButtonStyle.Danger)
-        .setDisabled(false),
-      new ButtonBuilder()
-        .setCustomId(`incident:closed:${incident.id}`)
-        .setLabel("Close")
-        .setStyle(ButtonStyle.Success)
-        .setDisabled(false),
-    ),
-  ];
+  const decisionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`incident:under_review:${incident.id}`)
+      .setLabel("Reviewing")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(incident.status === "under_review"),
+    new ButtonBuilder()
+      .setCustomId(`incident:need_more_info:${incident.id}`)
+      .setLabel("Need Info")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(incident.status === "need_more_info"),
+    new ButtonBuilder()
+      .setCustomId(`incident:no_action:${incident.id}`)
+      .setLabel("No Action")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(incident.status === "no_action"),
+    new ButtonBuilder()
+      .setCustomId(`incident:penalty:${incident.id}`)
+      .setLabel("Penalty")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(incident.status === "penalty"),
+    new ButtonBuilder()
+      .setCustomId(`incident:closed:${incident.id}`)
+      .setLabel("Close")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(incident.status === "closed"),
+  );
 
-  if (incident.evidenceUrl) {
-    rows.push(
-      new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setLabel("Open Video")
-          .setStyle(ButtonStyle.Link)
-          .setURL(incident.evidenceUrl),
-      ),
-    );
-  }
+  const evidenceButton = incident.evidenceUrl
+    ? new ButtonBuilder()
+        .setLabel("Open Video")
+        .setStyle(ButtonStyle.Link)
+        .setURL(incident.evidenceUrl)
+    : new ButtonBuilder()
+        .setCustomId(`incident:no_video:${incident.id}`)
+        .setLabel("No Video Link")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true);
+
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [
+    decisionRow,
+    new ActionRowBuilder<ButtonBuilder>().addComponents(evidenceButton),
+  ];
 
   return rows;
 }
@@ -111,6 +121,17 @@ function truncateText(value: string, maxLength: number): string {
   }
 
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatFollowUps(incident: Incident, limit: number): string {
+  const followUps = incident.history
+    .filter((event) => event.action === "user_response" && event.note)
+    .slice(-limit)
+    .reverse()
+    .map((event) => `${formatDiscordTimestamp(event.createdAt)} <@${event.actorUserId}>: ${truncateText(event.note ?? "", 280)}`)
+    .join("\n\n");
+
+  return truncateText(followUps, 1000);
 }
 
 export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
@@ -157,6 +178,7 @@ export function buildLogEmbed(incident: Incident): EmbedBuilder {
 
   return buildIncidentEmbed(incident)
     .setTitle(`${formatIncidentId(incident.id)} Final Incident Log`)
+    .setDescription(`**${formatStatus(incident.status)}**`)
     .addFields({
       name: "Recent Timeline",
       value: history || "No timeline entries recorded.",

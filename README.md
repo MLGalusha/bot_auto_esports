@@ -4,8 +4,8 @@ Discord bot for submitting racing incidents, routing them to a private admin rev
 
 Each submitted incident creates:
 
-- A private review message in the configured admin channel.
-- A discussion thread attached to that review message.
+- A private review card in the configured admin channel with the incident details, evidence link, and admin actions.
+- A discussion thread attached to that review card.
 - Buttons for admin status updates and decisions.
 - Optional private log entries when final statuses are reached.
 
@@ -124,7 +124,7 @@ Admin actions are handled with buttons on the private review message.
 7. Confirm the bot posts a review message in the private review channel.
 8. Confirm the bot creates a thread for that incident.
 9. Use the admin buttons to move it to `Under Review`, `Need Info`, `No Action`, `Penalty`, or `Closed`.
-10. Use the status screen follow-up button as the reporter to add follow-up info or file uploads after `Need Info`.
+10. Use `/incident status` to reopen the newest incident card. Use the `Incident List` dropdown to switch incidents, or the follow-up button to add info after `Need Info`.
 
 If submission fails with a review channel permission message, run:
 

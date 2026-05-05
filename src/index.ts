@@ -180,10 +180,19 @@ async function handleStatus(interaction: ChatInputCommandInteraction): Promise<v
   }
 
   const incidents = await listIncidentsForUser(interaction.guildId, interaction.user.id);
+  if (incidents.length === 0) {
+    await interaction.reply({
+      ephemeral: true,
+      embeds: [buildIncidentListEmbed(incidents)],
+      components: [],
+    });
+    return;
+  }
+
   await interaction.reply({
     ephemeral: true,
-    embeds: [buildIncidentListEmbed(incidents)],
-    components: buildIncidentListComponents(incidents),
+    embeds: [buildStatusEmbed(incidents[0])],
+    components: buildStatusComponents(incidents[0], incidents),
   });
 }
 
@@ -198,7 +207,10 @@ function buildIncidentListEmbed(incidents: Incident[]): EmbedBuilder {
     );
 }
 
-function buildIncidentListComponents(incidents: Incident[]): ActionRowBuilder<StringSelectMenuBuilder>[] {
+function buildIncidentListComponents(
+  incidents: Incident[],
+  selectedIncidentId?: string,
+): ActionRowBuilder<StringSelectMenuBuilder>[] {
   const options = incidents.slice(0, 25);
   if (options.length === 0) {
     return [];
@@ -208,7 +220,7 @@ function buildIncidentListComponents(incidents: Incident[]): ActionRowBuilder<St
     new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId("status:select")
-        .setPlaceholder("Select an incident")
+        .setPlaceholder("Incident List")
         .addOptions(
           options.map((incident) =>
             new StringSelectMenuOptionBuilder()
@@ -216,7 +228,8 @@ function buildIncidentListComponents(incidents: Incident[]): ActionRowBuilder<St
               .setDescription(
                 truncateText(`${formatShortDate(incident.createdAt)} | ${formatStatus(incident.status)} | ${incident.lapOrTime}`, 100),
               )
-              .setValue(incident.id),
+              .setValue(incident.id)
+              .setDefault(incident.id === selectedIncidentId),
           ),
         ),
     ),
@@ -241,6 +254,11 @@ function buildStatusEmbed(incident: Incident): EmbedBuilder {
     )
     .setTimestamp(new Date());
 
+  const followUps = formatFollowUps(incident, 5);
+  if (followUps) {
+    embed.addFields({ name: "Follow-Ups", value: followUps, inline: false });
+  }
+
   if (incident.decisionNote) {
     embed.addFields({ name: "Latest Admin Note", value: incident.decisionNote, inline: false });
   }
@@ -248,30 +266,30 @@ function buildStatusEmbed(incident: Incident): EmbedBuilder {
   return embed;
 }
 
-function buildStatusComponents(incident: Incident, showBackButton: boolean): ActionRowBuilder<ButtonBuilder>[] {
-  const buttons: ButtonBuilder[] = [
-    new ButtonBuilder()
-      .setCustomId(`status:view:${incident.id}`)
-      .setLabel("Refresh")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId(`followup:open:${incident.id}`)
-      .setLabel("Add Follow-Up")
-      .setStyle(ButtonStyle.Primary),
-  ];
-
-  if (showBackButton) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId("status:list")
-        .setLabel("Back to List")
-        .setStyle(ButtonStyle.Secondary),
-    );
+function buildStatusComponents(
+  incident: Incident,
+  incidents: Incident[] = [],
+): ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] {
+  const rows: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[] = [];
+  const incidentListRows = buildIncidentListComponents(incidents, incident.id);
+  if (incidentListRows.length > 0) {
+    rows.push(...incidentListRows);
   }
 
-  return [
-    new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
-  ];
+  rows.push(
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`status:view:${incident.id}`)
+        .setLabel("Refresh")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`followup:open:${incident.id}`)
+        .setLabel("Add Follow-Up")
+        .setStyle(ButtonStyle.Primary),
+    ),
+  );
+
+  return rows;
 }
 
 function canViewIncident(userId: string, incident: Incident): boolean {
@@ -284,6 +302,17 @@ function truncateText(value: string, maxLength: number): string {
   }
 
   return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatFollowUps(incident: Incident, limit: number): string {
+  const followUps = incident.history
+    .filter((event) => event.action === "user_response" && event.note)
+    .slice(-limit)
+    .reverse()
+    .map((event) => `${formatDiscordTimestamp(event.createdAt)} <@${event.actorUserId}>: ${truncateText(event.note ?? "", 280)}`)
+    .join("\n\n");
+
+  return truncateText(followUps, 1000);
 }
 
 function formatDiscordTimestamp(isoDate: string): string {
@@ -339,28 +368,13 @@ async function postReviewMessage(incident: Incident) {
     reason: `Incident review thread for ${formatIncidentId(incident.id)}`,
   });
 
-  await thread.send(
-    [
-      incident.evidenceUrl,
-      `**${formatIncidentId(incident.id)} Review Thread**`,
-      `**Rule Area:** ${getIncidentCategoryLabel(incident.category)}`,
-      `**Context:** ${getRacePhaseLabel(incident.racePhase)}`,
-      `**Impact:** ${getIncidentImpactLabel(incident.impact)}`,
-      "",
-      "Use the buttons on the parent review message to update status or record the decision.",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  );
-
   return { message, threadId: thread.id };
 }
 
 function buildReviewMessageContent(incident: Incident): string {
   const lines = [
-    incident.evidenceUrl,
     `${config.stewardRoleId ? `<@&${config.stewardRoleId}> ` : ""}**New Incident Submitted:** ${formatIncidentId(incident.id)}`,
-    `**Rule Area:** ${getIncidentCategoryLabel(incident.category)} | **Status:** ${formatStatus(incident.status)}`,
+    `Open the thread on this card to discuss. Use the card buttons for review decisions.`,
   ];
 
   return lines.filter(Boolean).join("\n");
@@ -391,9 +405,13 @@ async function handleStringSelect(interaction: StringSelectMenuInteraction): Pro
       return;
     }
 
+    const incidents = interaction.guildId
+      ? await listIncidentsForUser(interaction.guildId, interaction.user.id)
+      : [incident];
+
     await interaction.update({
       embeds: [buildStatusEmbed(incident)],
-      components: buildStatusComponents(incident, Boolean(interaction.guildId)),
+      components: buildStatusComponents(incident, incidents),
     });
     return;
   }
@@ -458,9 +476,17 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     }
 
     const incidents = await listIncidentsForUser(interaction.guildId, interaction.user.id);
+    if (incidents.length === 0) {
+      await interaction.update({
+        embeds: [buildIncidentListEmbed(incidents)],
+        components: [],
+      });
+      return;
+    }
+
     await interaction.update({
-      embeds: [buildIncidentListEmbed(incidents)],
-      components: buildIncidentListComponents(incidents),
+      embeds: [buildStatusEmbed(incidents[0])],
+      components: buildStatusComponents(incidents[0], incidents),
     });
     return;
   }
@@ -507,9 +533,13 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
+    const incidents = interaction.guildId
+      ? await listIncidentsForUser(interaction.guildId, interaction.user.id)
+      : [incident];
+
     await interaction.update({
       embeds: [buildStatusEmbed(incident)],
-      components: buildStatusComponents(incident, Boolean(interaction.guildId)),
+      components: buildStatusComponents(incident, incidents),
     });
     return;
   }
@@ -1012,10 +1042,11 @@ async function submitIncidentDraft(interaction: ButtonInteraction, draft: Requir
     reviewMessageId: reviewTarget.message.id,
     reviewThreadId: reviewTarget.threadId,
   }));
+  const incidents = await listIncidentsForUser(interaction.guildId, interaction.user.id);
 
   await interaction.editReply({
     embeds: [buildSubmissionReceiptEmbed(incident)],
-    components: buildStatusComponents(incident, false),
+    components: buildStatusComponents(incident, incidents),
     content: "",
   });
 
@@ -1039,15 +1070,31 @@ async function handleFollowUpModal(interaction: ModalSubmitInteraction): Promise
     return;
   }
 
-  await interaction.deferReply({ ephemeral: Boolean(interaction.guildId) });
-
   const message = interaction.fields.getTextInputValue("message");
   const evidenceLink = interaction.fields.getTextInputValue("evidence_link") || undefined;
   const note = evidenceLink ? `${message}\nEvidence: ${evidenceLink}` : message;
 
   const updated = await addUserFollowUp(id, interaction.user.id, note);
-  await postUserResponseToReview(updated ?? incident, interaction.user.id, note);
-  await interaction.editReply(`Your follow-up was added to ${formatIncidentId(id)} for admin review.`);
+  const latestIncident = updated ?? incident;
+  await refreshReviewMessage(latestIncident);
+
+  if (interaction.isFromMessage()) {
+    const incidents = interaction.guildId
+      ? await listIncidentsForUser(interaction.guildId, interaction.user.id)
+      : [latestIncident];
+
+    await interaction.update({
+      embeds: [buildStatusEmbed(latestIncident)],
+      components: buildStatusComponents(latestIncident, incidents),
+      content: "",
+    });
+    return;
+  }
+
+  await interaction.reply({
+    content: `Your follow-up was added to ${formatIncidentId(id)} for admin review.`,
+    ephemeral: Boolean(interaction.guildId),
+  });
 }
 
 async function updateStatus(
@@ -1103,26 +1150,6 @@ async function refreshReviewMessage(incident: Incident): Promise<void> {
   await message.edit({
     embeds: [buildIncidentEmbed(incident)],
     components: buildReviewActions(incident),
-  });
-}
-
-async function postUserResponseToReview(
-  incident: Incident,
-  userId: string,
-  note: string,
-): Promise<void> {
-  const targetChannelId = incident.reviewThreadId ?? incident.reviewChannelId;
-  if (!targetChannelId) {
-    return;
-  }
-
-  const channel = await client.channels.fetch(targetChannelId);
-  if (!channel?.isTextBased() || !("send" in channel)) {
-    return;
-  }
-
-  await channel.send({
-    content: `Follow-up from <@${userId}> for ${formatIncidentId(incident.id)}:\n${note}`,
   });
 }
 
