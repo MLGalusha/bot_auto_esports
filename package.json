@@ -1,0 +1,21 @@
+{
+  "name": "bot-auto-esports",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --import tsx src/index.ts",
+    "doctor": "node --import tsx src/doctor.ts",
+    "register:commands": "node --import tsx src/register-commands.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.19",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
