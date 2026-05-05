@@ -125,6 +125,7 @@ export function buildSubmissionReceiptEmbed(incident: Incident): EmbedBuilder {
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
+      { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
       { name: "Other Drivers", value: incident.involvedDriversText, inline: false },
       { name: "Summary", value: incident.description, inline: false },
     )

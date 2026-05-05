@@ -223,7 +223,7 @@ function buildIncidentListComponents(incidents: Incident[]): ActionRowBuilder<St
   ];
 }
 
-function buildStatusEmbed(incident: Incident, showVideo = false): EmbedBuilder {
+function buildStatusEmbed(incident: Incident): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setTitle(`Incident ${formatIncidentId(incident.id)}`)
     .setColor(0x2563eb)
@@ -235,6 +235,7 @@ function buildStatusEmbed(incident: Incident, showVideo = false): EmbedBuilder {
       { name: "Context", value: getRacePhaseLabel(incident.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(incident.impact), inline: true },
       { name: "Time", value: incident.lapOrTime, inline: true },
+      { name: "Video Link", value: incident.evidenceUrl ?? "Not provided", inline: false },
       { name: "Other Drivers", value: incident.involvedDriversText, inline: false },
       { name: "Summary", value: incident.description, inline: false },
     )
@@ -244,14 +245,10 @@ function buildStatusEmbed(incident: Incident, showVideo = false): EmbedBuilder {
     embed.addFields({ name: "Latest Admin Note", value: incident.decisionNote, inline: false });
   }
 
-  if (showVideo && incident.evidenceUrl) {
-    embed.addFields({ name: "Video Link", value: incident.evidenceUrl, inline: false });
-  }
-
   return embed;
 }
 
-function buildStatusComponents(incident: Incident, showBackButton: boolean, showVideo = false): ActionRowBuilder<ButtonBuilder>[] {
+function buildStatusComponents(incident: Incident, showBackButton: boolean): ActionRowBuilder<ButtonBuilder>[] {
   const buttons: ButtonBuilder[] = [
     new ButtonBuilder()
       .setCustomId(`status:view:${incident.id}`)
@@ -262,15 +259,6 @@ function buildStatusComponents(incident: Incident, showBackButton: boolean, show
       .setLabel("Add Follow-Up")
       .setStyle(ButtonStyle.Primary),
   ];
-
-  if (incident.evidenceUrl) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId(`video:toggle:${incident.id}:${showVideo ? "hide" : "show"}`)
-        .setLabel(showVideo ? "Hide Video" : "Show Video")
-        .setStyle(ButtonStyle.Secondary),
-    );
-  }
 
   if (showBackButton) {
     buttons.push(
@@ -477,43 +465,6 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
     return;
   }
 
-  if (interaction.customId.startsWith("video:toggle:")) {
-    const [, , id, nextState] = interaction.customId.split(":");
-    const incident = await getIncident(id);
-
-    if (!incident) {
-      await interaction.reply({ content: `I could not find incident ${formatIncidentId(id)}.`, ephemeral: Boolean(interaction.guildId) });
-      return;
-    }
-
-    const canView =
-      canViewIncident(interaction.user.id, incident) ||
-      Boolean(interaction.guildId && canModerate(interaction.member, interaction.memberPermissions));
-
-    if (!canView) {
-      await interaction.reply({
-        content: "You can only view videos for incidents you submitted or were involved in.",
-        ephemeral: Boolean(interaction.guildId),
-      });
-      return;
-    }
-
-    if (!incident.evidenceUrl) {
-      await interaction.update({
-        embeds: [buildStatusEmbed(incident, false)],
-        components: buildStatusComponents(incident, Boolean(interaction.guildId), false),
-      });
-      return;
-    }
-
-    const showVideo = nextState === "show";
-    await interaction.update({
-      embeds: [buildStatusEmbed(incident, showVideo)],
-      components: buildStatusComponents(incident, Boolean(interaction.guildId), showVideo),
-    });
-    return;
-  }
-
   if (interaction.customId.startsWith("followup:open:")) {
     const [, , id] = interaction.customId.split(":");
     const incident = await getIncident(id);
@@ -592,23 +543,8 @@ async function handleButton(interaction: ButtonInteraction): Promise<void> {
       return;
     }
 
-    if (intakeCustomId.action === "set_video") {
-      await openIntakeTextModal(interaction, "video", draft);
-      return;
-    }
-
-    if (intakeCustomId.action === "set_location") {
-      await openIntakeTextModal(interaction, "location", draft);
-      return;
-    }
-
-    if (intakeCustomId.action === "set_summary") {
-      await openIntakeTextModal(interaction, "summary", draft);
-      return;
-    }
-
-    if (intakeCustomId.action === "drivers") {
-      await interaction.showModal(buildDriversModal(draft));
+    if (["details", "drivers", "set_video", "set_location", "set_summary"].includes(intakeCustomId.action)) {
+      await interaction.showModal(buildIntakeDetailsModal(draft));
       return;
     }
 
@@ -704,13 +640,18 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
     return;
   }
 
-  if (interaction.customId === "intake-drivers" || interaction.customId.startsWith("intake-drivers:")) {
-    await handleDriversModal(interaction);
+  if (
+    interaction.customId === "intake-details" ||
+    interaction.customId.startsWith("intake-details:") ||
+    interaction.customId === "intake-drivers" ||
+    interaction.customId.startsWith("intake-drivers:")
+  ) {
+    await handleIntakeDetailsModal(interaction);
     return;
   }
 
   if (interaction.customId.startsWith("intake-set:")) {
-    await handleIntakeTextModal(interaction);
+    await handleLegacyIntakeTextModal(interaction);
     return;
   }
 
@@ -736,21 +677,21 @@ async function handleModal(interaction: ModalSubmitInteraction): Promise<void> {
 function buildIntakeEmbed(draft: IntakeDraft): EmbedBuilder {
   return new EmbedBuilder()
     .setTitle("AERO Incident Intake")
-    .setColor(0x2563eb)
+    .setColor(getIntakeEmbedColor(draft))
     .setDescription(
       [
-        "Build the report from the race rules first, then add the missing details with the buttons below.",
-        "",
+        formatIntakeSubmitStatus(draft),
         "Incidents are queued for admin review. Do not argue with other drivers during the race or session.",
         "",
         "Evidence should show a few seconds before and after the incident when possible.",
       ].join("\n"),
     )
     .addFields(
+      { name: "Rules Selected", value: "\u200b", inline: false },
       { name: "Rule Area", value: getIncidentCategoryLabel(draft.category ?? "Not selected"), inline: true },
       { name: "Context", value: getRacePhaseLabel(draft.racePhase), inline: true },
       { name: "Impact", value: getIncidentImpactLabel(draft.impact), inline: true },
-      { name: "Video", value: getEvidenceReadinessLabel(draft.evidenceReadiness), inline: true },
+      { name: "Report Details", value: "\u200b", inline: false },
       { name: "Your Gamertag", value: draft.reporterGamertag ?? "Not added", inline: true },
       { name: "Video Link", value: formatDraftVideoLinkStatus(draft), inline: true },
       { name: "Time", value: draft.lapOrTime ?? "Not added", inline: true },
@@ -780,35 +721,14 @@ function buildIntakeComponents(draft: IntakeDraft): ActionRowBuilder<StringSelec
   rows.push(
     new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
-        .setCustomId(buildIntakeCustomId(draft, "drivers"))
-        .setLabel(`Drivers${draft.drivers.length > 0 ? ` (${draft.drivers.length})` : ""}`)
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(buildIntakeCustomId(draft, "set_video"))
-        .setLabel("Video Link")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(buildIntakeCustomId(draft, "set_location"))
-        .setLabel("Time")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(buildIntakeCustomId(draft, "set_summary"))
-        .setLabel("Summary")
-        .setStyle(ButtonStyle.Secondary),
-    ),
-  );
-
-  rows.push(
-    new ActionRowBuilder<ButtonBuilder>().addComponents(
+        .setCustomId(buildIntakeCustomId(draft, "details"))
+        .setLabel("Details")
+        .setStyle(getDetailsButtonStyle(draft)),
       new ButtonBuilder()
         .setCustomId(buildIntakeCustomId(draft, "submit"))
-        .setLabel("Submit Incident")
+        .setLabel("Submit")
         .setStyle(ButtonStyle.Primary)
         .setDisabled(!isIntakeComplete(draft)),
-      new ButtonBuilder()
-        .setCustomId(buildIntakeCustomId(draft, "reset"))
-        .setLabel("Reset")
-        .setStyle(ButtonStyle.Secondary),
     ),
   );
 
@@ -843,10 +763,10 @@ function buildSelectRow(
   );
 }
 
-function buildDriversModal(draft: IntakeDraft): ModalBuilder {
+function buildIntakeDetailsModal(draft: IntakeDraft): ModalBuilder {
   const modal = new ModalBuilder()
-    .setCustomId(`intake-drivers:${draft.id}`)
-    .setTitle("Drivers");
+    .setCustomId(`intake-details:${draft.id}`)
+    .setTitle("Incident Details");
 
   const reporterGamertag = new TextInputBuilder()
     .setCustomId("reporter_gamertag")
@@ -872,74 +792,55 @@ function buildDriversModal(draft: IntakeDraft): ModalBuilder {
     drivers.setValue(draft.drivers.join("\n"));
   }
 
+  const evidenceLink = new TextInputBuilder()
+    .setCustomId("evidence_link")
+    .setLabel("Video link")
+    .setPlaceholder("Paste video URL")
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(500)
+    .setRequired(draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip");
+
+  if (draft.evidenceLink) {
+    evidenceLink.setValue(draft.evidenceLink);
+  }
+
+  const lapOrTime = new TextInputBuilder()
+    .setCustomId("lap_or_time")
+    .setLabel("Time in video")
+    .setPlaceholder("0:42 in clip, Lap 12, T1")
+    .setStyle(TextInputStyle.Short)
+    .setMaxLength(140)
+    .setRequired(true);
+
+  if (draft.lapOrTime) {
+    lapOrTime.setValue(draft.lapOrTime);
+  }
+
+  const summary = new TextInputBuilder()
+    .setCustomId("summary")
+    .setLabel("What happened?")
+    .setPlaceholder("Short summary for admins")
+    .setStyle(TextInputStyle.Paragraph)
+    .setMaxLength(1800)
+    .setRequired(true);
+
+  if (draft.description) {
+    summary.setValue(draft.description);
+  }
+
   modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(reporterGamertag),
     new ActionRowBuilder<TextInputBuilder>().addComponents(drivers),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(evidenceLink),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(lapOrTime),
+    new ActionRowBuilder<TextInputBuilder>().addComponents(summary),
   );
   return modal;
 }
 
-type IntakeTextField = "video" | "location" | "summary";
-
-function buildIntakeTextModal(field: IntakeTextField, draft: IntakeDraft): ModalBuilder {
-  const modal = new ModalBuilder()
-    .setCustomId(`intake-set:${draft.id}:${field}`)
-    .setTitle(intakeFieldTitle(field));
-
-  const input = new TextInputBuilder()
-    .setCustomId("value")
-    .setLabel(intakeFieldLabel(field))
-    .setPlaceholder(intakeFieldPlaceholder(field))
-    .setStyle(field === "summary" ? TextInputStyle.Paragraph : TextInputStyle.Short)
-    .setMaxLength(field === "summary" ? 1800 : field === "video" ? 500 : 140)
-    .setRequired(field !== "video" || (draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip"));
-
-  const existingValue =
-    field === "video" ? draft.evidenceLink : field === "location" ? draft.lapOrTime : draft.description;
-  if (existingValue) {
-    input.setValue(existingValue);
-  }
-
-  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
-  return modal;
-}
-
-function intakeFieldTitle(field: IntakeTextField): string {
-  switch (field) {
-    case "video":
-      return "Video Link";
-    case "location":
-      return "Incident Time";
-    case "summary":
-      return "Summary";
-  }
-}
-
-function intakeFieldLabel(field: IntakeTextField): string {
-  switch (field) {
-    case "video":
-      return "Paste clip link (Xbox share link works)";
-    case "location":
-      return "Time in video";
-    case "summary":
-      return "What happened?";
-  }
-}
-
-function intakeFieldPlaceholder(field: IntakeTextField): string {
-  switch (field) {
-    case "video":
-      return "Paste video URL";
-    case "location":
-      return "0:42 in clip, Lap 12, T1";
-    case "summary":
-      return "Short summary for admins";
-  }
-}
-
-async function handleDriversModal(interaction: ModalSubmitInteraction): Promise<void> {
+async function handleIntakeDetailsModal(interaction: ModalSubmitInteraction): Promise<void> {
   if (!interaction.guildId) {
-    await interaction.reply({ content: "Drivers can only be edited inside a server.", ephemeral: true });
+    await interaction.reply({ content: "Incident details can only be edited inside a server.", ephemeral: true });
     return;
   }
 
@@ -955,24 +856,33 @@ async function handleDriversModal(interaction: ModalSubmitInteraction): Promise<
     return;
   }
 
-  const reporterGamertag = interaction.fields.getTextInputValue("reporter_gamertag").trim();
-  const drivers = interaction.fields.getTextInputValue("drivers");
+  const reporterGamertag = getOptionalModalTextValue(interaction, "reporter_gamertag").trim();
+  const drivers = getOptionalModalTextValue(interaction, "drivers");
+  const evidenceLink = getOptionalModalTextValue(interaction, "evidence_link").trim();
+  const lapOrTime = getOptionalModalTextValue(interaction, "lap_or_time").trim();
+  const summary = getOptionalModalTextValue(interaction, "summary").trim();
+
   draft.reporterGamertag = reporterGamertag || undefined;
   draft.drivers = normalizeDrivers(drivers).slice(0, 12);
+  if (interaction.customId.startsWith("intake-details:")) {
+    draft.evidenceLink = evidenceLink || undefined;
+    draft.lapOrTime = lapOrTime || undefined;
+    draft.description = summary || undefined;
+  }
   intakeDrafts.set(getIntakeKey(draft.guildId, interaction.user.id), draft);
 
   await updateIntakeModalSource(interaction, draft);
 }
 
-async function openIntakeTextModal(
-  interaction: ButtonInteraction,
-  field: IntakeTextField,
-  draft: IntakeDraft,
-): Promise<void> {
-  await interaction.showModal(buildIntakeTextModal(field, draft));
+function getOptionalModalTextValue(interaction: ModalSubmitInteraction, customId: string): string {
+  try {
+    return interaction.fields.getTextInputValue(customId);
+  } catch {
+    return "";
+  }
 }
 
-async function handleIntakeTextModal(interaction: ModalSubmitInteraction): Promise<void> {
+async function handleLegacyIntakeTextModal(interaction: ModalSubmitInteraction): Promise<void> {
   if (!interaction.guildId) {
     await interaction.reply({ content: "Incident details can only be edited inside a server.", ephemeral: true });
     return;
@@ -1289,13 +1199,13 @@ function parseIntakeCustomId(customId: string): ParsedIntakeCustomId | undefined
   return { draftId: parts[1], action: parts[2] };
 }
 
-function parseIntakeTextModalCustomId(customId: string): { draftId?: string; field: IntakeTextField } {
+function parseIntakeTextModalCustomId(customId: string): { draftId?: string; field: "video" | "location" | "summary" } {
   const parts = customId.split(":");
   if (parts.length === 2) {
-    return { field: parts[1] as IntakeTextField };
+    return { field: parts[1] as "video" | "location" | "summary" };
   }
 
-  return { draftId: parts[1], field: parts[2] as IntakeTextField };
+  return { draftId: parts[1], field: parts[2] as "video" | "location" | "summary" };
 }
 
 function buildInactiveIntakeEmbed(title: string, description: string): EmbedBuilder {
@@ -1352,6 +1262,45 @@ function getIncompleteIntakeMessage(draft: IntakeDraft): string {
   }
 
   return "Complete the required incident details first.";
+}
+
+function formatIntakeSubmitStatus(draft: IntakeDraft): string {
+  const missing = getMissingIntakeItems(draft);
+  if (missing.length === 0) {
+    return "**Ready to submit.** Review the details below, then submit the incident.";
+  }
+
+  return [
+    "**Cannot submit yet.**",
+    `Needs: ${missing.join(", ")}.`,
+  ].join("\n");
+}
+
+function getIntakeEmbedColor(draft: IntakeDraft): number {
+  if (draft.evidenceLink && !isValidHttpUrl(draft.evidenceLink)) {
+    return 0xef4444;
+  }
+
+  return isIntakeComplete(draft) ? 0x10b981 : 0x2563eb;
+}
+
+function getMissingIntakeItems(draft: IntakeDraft): string[] {
+  const missing: string[] = [];
+  const hasImpact = !shouldShowImpactSelect(draft.category) || Boolean(draft.impact);
+  const hasEvidence = !shouldShowEvidenceSelect(draft.category) || Boolean(draft.evidenceReadiness);
+  const needsVideo = draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip";
+
+  if (!draft.category) missing.push("rule area");
+  if (!draft.racePhase) missing.push("context");
+  if (!hasImpact) missing.push("impact");
+  if (!hasEvidence) missing.push("video status");
+  if (!draft.reporterGamertag) missing.push("your gamertag");
+  if (needsVideo && !draft.evidenceLink) missing.push("video link");
+  if (draft.evidenceLink && !isValidHttpUrl(draft.evidenceLink)) missing.push("valid video link");
+  if (!draft.lapOrTime) missing.push("time");
+  if (!draft.description) missing.push("summary");
+
+  return missing;
 }
 
 async function assertReviewChannelReady(): Promise<void> {
@@ -1460,7 +1409,33 @@ function formatDraftVideoLinkStatus(draft: IntakeDraft): string {
     return "Not added";
   }
 
-  return isValidHttpUrl(draft.evidenceLink) ? "Added" : "Invalid link";
+  return isValidHttpUrl(draft.evidenceLink)
+    ? draft.evidenceLink
+    : `Invalid link\n${truncateFieldValue(draft.evidenceLink, 120)}\nUse a full \`https://...\` URL`;
+}
+
+function truncateFieldValue(value: string, maxLength: number): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function getDetailsButtonStyle(draft: IntakeDraft): ButtonStyle {
+  if (draft.evidenceLink && !isValidHttpUrl(draft.evidenceLink)) {
+    return ButtonStyle.Danger;
+  }
+
+  const needsVideo = draft.evidenceReadiness !== "needs_upload" && draft.evidenceReadiness !== "no_clip";
+  const hasRequiredDetails = Boolean(
+    draft.reporterGamertag &&
+      (!needsVideo || draft.evidenceLink) &&
+      draft.lapOrTime &&
+      draft.description,
+  );
+
+  return hasRequiredDetails ? ButtonStyle.Success : ButtonStyle.Secondary;
 }
 
 function hasValidEvidenceLink(draft: IntakeDraft): boolean {
